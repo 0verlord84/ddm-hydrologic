@@ -1,0 +1,17 @@
+# Pylint configuration for DDM HydroLogic.
+#
+# qgis and osgeo are provided by the QGIS runtime and are not importable in a
+# plain Python environment, so they are ignored to avoid false import/member
+# errors when linting outside QGIS.
+
+[MASTER]
+ignored-modules=qgis,osgeo
+
+[FORMAT]
+max-line-length=120
+
+[MESSAGES CONTROL]
+# broad-exception-caught: the plugin deliberately wraps QGIS API calls in broad
+# try/except blocks so a single API change between QGIS builds degrades
+# gracefully instead of crashing the dock.
+disable=broad-exception-caught
