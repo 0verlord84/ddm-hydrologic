@@ -1444,7 +1444,6 @@ class DDMHydroLogicDock(QDockWidget):
         else:
             QMessageBox.critical(self, "DDM HydroLogic", f"{title} failed:\n\n{exc}")
 
-
     def export_rorb_catg(self):
         """Export the current plugin outputs to a RORBwin/RORB GE .catg file."""
         if not self._require_engine_and_layer():
@@ -1523,8 +1522,8 @@ class DDMHydroLogicDock(QDockWidget):
             self.status_label.setText(
                 f"Exported RORB .catg file: {output_path}. "
                 f"Basins/subareas: {basin_count:,}; reaches: {reach_count:,}. "
-                f"Loaded temporary RORB layers: {', '.join(loaded_rorb_layers) if loaded_rorb_layers else 'none'}. "
-                + ("The drawn outlet line was used as the RORB outlet." if outlet_point is not None else "No drawn outlet line was available, so the outlet was inferred from the terminal drainage point.")
+                f"Loaded temporary RORB layers: {', '.join(loaded_rorb_layers) if loaded_rorb_layers else 'none'}. " +
+                ("The drawn outlet line was used as the RORB outlet." if outlet_point is not None else "No drawn outlet line was available, so the outlet was inferred from the terminal drainage point.")
             )
             QMessageBox.information(
                 self,
@@ -1533,8 +1532,8 @@ class DDMHydroLogicDock(QDockWidget):
                 f"{output_path}\n\n"
                 f"Subareas: {basin_count:,}\n"
                 f"Reaches: {reach_count:,}\n\n"
-                "Review the generated catchment in RORBwin/RORB GE before running hydrology. Subcatchment areas are written to basin/node attributes and fraction impervious defaults to 0.00. "
-                + ("The drawn outlet line was used as the explicit RORB outlet." if outlet_point is not None else "No drawn outlet line was available, so the outlet was inferred from the terminal drainage point."),
+                "Review the generated catchment in RORBwin/RORB GE before running hydrology. Subcatchment areas are written to basin/node attributes and fraction impervious defaults to 0.00. " +
+                ("The drawn outlet line was used as the explicit RORB outlet." if outlet_point is not None else "No drawn outlet line was available, so the outlet was inferred from the terminal drainage point."),
             )
         except HydrologyCancelled:
             self.status_label.setText("RORB .catg export aborted.")
@@ -1818,7 +1817,6 @@ class DDMHydroLogicDock(QDockWidget):
         except Exception:
             pass
 
-
         self.canvas.refresh()
         return loaded
 
@@ -2009,7 +2007,6 @@ class DDMHydroLogicDock(QDockWidget):
         gc.collect()
         self.progress.setValue(100)
         self.status_label.setText("Subcatchments cleared. Adjust 7. Minimum subcatchment size and press 8. Process subcatchments to recompute them.")
-
 
     def _cleanup_after_abort(self, clear_engine=False):
         """Release unnecessary temporary layers, selections and large Python objects after abort."""
