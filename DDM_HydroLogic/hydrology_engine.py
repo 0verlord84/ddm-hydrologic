@@ -169,7 +169,6 @@ class D8HydrologyEngine:
         suffix = f"; analysis mask cells: {self.mask_cell_count:,}" if self.mask_layer is not None else ""
         self._emit(12, f"DEM read: {self.cols} x {self.rows} cells{suffix}")
 
-
     def _combined_mask_geometry_in_dem_crs(self):
         """Return the optional analysis mask geometry transformed to the DEM CRS."""
         layer = self.mask_layer
@@ -357,8 +356,8 @@ class D8HydrologyEngine:
 
         directions = (
             (-1, -1), (-1, 0), (-1, 1),
-            (0, -1),           (0, 1),
-            (1, -1),  (1, 0),  (1, 1),
+            (0, -1), (0, 1),
+            (1, -1), (1, 0), (1, 1),
         )
 
         heap = []
@@ -649,7 +648,6 @@ class D8HydrologyEngine:
 
         self.display_strahler_by_cell = stream_order
         return stream_order
-
 
     def create_flow_layer(self, min_accumulation=1):
         """Create a temporary line layer containing cell-to-cell flow segments."""
