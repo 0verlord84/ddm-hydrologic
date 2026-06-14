@@ -2,40 +2,36 @@
 name=DDM HydroLogic
 qgisMinimumVersion=4.0
 qgisMaximumVersion=4.99
-description=From DEM to model-ready catchments without leaving QGIS. Trace D8 flow paths, click the streams that matter, drop an outlet line, and export straight to GeoPackage, RORB, WBNM, XP-RAFTS or TUFLOW.
+description=Delineate and create model-ready catchments interactively. Trace D8 flow paths, click the streams that matter, drop an outlet line, and export straight to GeoPackage, RORB, WBNM, XP-RAFTS or TUFLOW.
 version=1.0
-author=Davide Di Mauro / DDM
-authorName=Davide Di Mauro / DDM
+changelog=1.0 - First release
+author=Davide Di Mauro
+initials=DDM
 email=dimauro.davide@gmail.com
-about=Setting up a hydrologic model usually means days of GIS work before the
-    modelling even starts: deriving flow paths, cutting subcatchments, measuring
-    areas, then retyping it all into the model. DDM HydroLogic squeezes that
-    into one interactive session in QGIS.
+about=Setting up a hydrologic model usually means a few hours of GIS prep work 
+    before the modelling even starts. DDM HydroLogic condenses some of the initial steps
+    into one interactive session: it traces D8 flow paths from a DEM, ranks them by 
+    Strahler order, and lets you pick the relevant drainage.
+    Draw an outlet line, set a minimum subcatchment size, and DDM HydroLogic cuts 
+    the catchment into dissolved subcatchment polygons — then you have choices of exporting as:
 
-    Point it at a DEM and it builds a connected D8 flow-path network, drawn by
-    Strahler order so the drainage reads at a glance. Click any reach to light
-    up everything that drains to it, sketch a mask to keep the analysis where
-    you want it, draw an outlet line, set a minimum subcatchment size, and the
-    plugin cuts the catchment into clean, dissolved subcatchment polygons.
+    GeoPackage of flow paths and subcatchments,
+    RORB .catg GE-ready catchment file,
+    WBNM .wbn runfile,
+    XP-RAFTS .xpx exchange file,
+    or some of the most popular TUFLOW xxx_R.shp.
 
-    Once the delineation looks right, the model files are one click each: a
-    GeoPackage of flow paths and subcatchments, a RORB .catg control file, a
-    WBNM .wbn runfile, an XP-RAFTS .xpx exchange file, or the seven TUFLOW
-    region shapefiles. Topology, areas and coordinates come straight from the
-    GIS; rainfall, losses and materials stay as clearly marked defaults, so the
-    modelling decisions remain yours.
+    It is important to note that all hydrological/hydraulic choices and parameters, such as 
+    rainfall, losses, Manning's coefficients, subcatchment types, slope, etc..
+    have been deliberately left blank or default values.
 
     Requirements and notes: QGIS 4.0 or newer, with no extra Python packages to
     install (it relies on the numpy and GDAL libraries already bundled with
-    QGIS). Work in a projected CRS for meaningful areas and lengths. The model
-    exports are first-pass scaffolds and need their own software to open and
-    finish: RORB, WBNM, XP-RAFTS or TUFLOW.
-
-    Licensed under the GNU General Public License version 2 or later; see the
-    LICENSE file.
-
-    Built by a water engineer who got tired of doing this by hand.
-category=Raster
+    QGIS). Work for DEMs in projected CRS for meaningful areas and lengths.
+    
+    Licensed under the GNU General Public License version 2 or later
+    
+category=Raster, Vector
 tags=catchment,watershed,hydrology,DEM,D8,Strahler,subcatchment,RORB,WBNM,XP-RAFTS,TUFLOW
 homepage=https://github.com/0verlord84/ddm-hydrologic
 repository=https://github.com/0verlord84/ddm-hydrologic
