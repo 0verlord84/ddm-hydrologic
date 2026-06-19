@@ -92,6 +92,7 @@ class DDMHydroLogicDock(QDockWidget):
         self.selection_polygon_geom = None
         self.selection_polygon_band = None
         self.selection_polygon_bands = []
+        self._catchment_geom_cache = {}
         self.outlet_line_band = None
         self.outlet_line_points = []
         self.outlet_line_layer_geom = None
@@ -946,10 +947,11 @@ class DDMHydroLogicDock(QDockWidget):
         return len(cells or [])
 
     def _refresh_selection_outputs(self):
-        """Refresh yellow path highlights and light-green catchment overlays."""
-        if self.engine is not None:
-            self.selected_catchment_groups = self.engine.normalize_overlapping_cell_groups(self.selected_catchment_groups)
+        """Refresh yellow path highlights and light-green catchment overlays.
 
+        Callers normalise ``selected_catchment_groups`` before calling this, so
+        normalisation is not repeated here.
+        """
         self.selected_highlight_cells = set()
         for cells in self.selected_catchment_groups.values():
             self.selected_highlight_cells.update(int(c) for c in cells)
@@ -970,6 +972,7 @@ class DDMHydroLogicDock(QDockWidget):
         self.selected_highlight_cells = set()
         self.selected_catchment_groups = {}
         self.selection_polygon_geom = None
+        self._catchment_geom_cache = {}
         self._remove_layer_if_present("highlight_layer")
         self._clear_selection_polygon_overlay()
         self.status_label.setText("Flow path selection reset. Yellow upstream highlights and light-green catchment overlays cleared.")
@@ -1154,27 +1157,49 @@ class DDMHydroLogicDock(QDockWidget):
             pass
 
     def _update_selection_polygon_overlays(self, selection_groups):
-        """Draw one non-overlapping light-green dissolved catchment overlay per selection group."""
+        """Draw one non-overlapping light-green dissolved catchment overlay per selection group.
+
+        Dissolved catchment geometries are cached per outlet id and reused across
+        clicks; only groups whose cell set changed are re-dissolved, and the
+        dissolve uses the fast GDAL polygonisation path.
+        """
         self._clear_selection_polygon_overlay()
         if self.engine is None or not selection_groups:
+            self._catchment_geom_cache = {}
             return
 
         source_crs = self.engine.flow_layer.crs() if self.engine.flow_layer is not None else self.engine.dem_layer.crs()
         dest_crs = self.canvas.mapSettings().destinationCrs()
+        transform = None
+        if source_crs != dest_crs:
+            transform = QgsCoordinateTransform(source_crs, dest_crs, QgsProject.instance())
+
+        old_cache = getattr(self, "_catchment_geom_cache", {})
+        new_cache = {}
         combined_geoms = []
 
-        for _outlet_id, selected_cells in list(selection_groups.items()):
+        for outlet_id, selected_cells in list(selection_groups.items()):
             self._check_abort_from_dock()
             if not selected_cells:
                 continue
-            geom = self.engine.dissolve_cells_to_geometry(selected_cells)
-            if geom.isNull() or geom.isEmpty():
-                continue
+            cells = set(int(c) for c in selected_cells)
 
-            if source_crs != dest_crs:
-                geom = QgsGeometry(geom)
-                transform = QgsCoordinateTransform(source_crs, dest_crs, QgsProject.instance())
+            # Reuse the dissolved geometry if this catchment's cells are unchanged.
+            cached = old_cache.get(int(outlet_id))
+            if cached is not None and cached[0] == cells:
+                geom_layer = cached[1]
+            else:
+                geom_layer = self.engine.dissolve_cells_fast(cells)
+            if geom_layer is None or geom_layer.isNull() or geom_layer.isEmpty():
+                continue
+            new_cache[int(outlet_id)] = (cells, geom_layer)
+
+            # Cache stores the layer-CRS geometry; transform a copy for display.
+            if transform is not None:
+                geom = QgsGeometry(geom_layer)
                 geom.transform(transform)
+            else:
+                geom = geom_layer
 
             band = QgsRubberBand(
                 self.canvas,
@@ -1192,6 +1217,7 @@ class DDMHydroLogicDock(QDockWidget):
             self.selection_polygon_bands.append(band)
             combined_geoms.append(geom)
 
+        self._catchment_geom_cache = new_cache
         if combined_geoms:
             self.selection_polygon_geom = QgsGeometry.unaryUnion(combined_geoms) if len(combined_geoms) > 1 else combined_geoms[0]
 

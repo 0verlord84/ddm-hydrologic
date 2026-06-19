@@ -1041,6 +1041,79 @@ class D8HydrologyEngine:
             return partials[0]
         return QgsGeometry.unaryUnion(partials)
 
+    def dissolve_cells_fast(self, cell_ids):
+        """Catchment-boundary polygon for the interactive overlay, the quick way.
+
+        Unioning one square polygon per cell is slow for large catchments. This
+        instead rasterises the selected cells into a small mask over just their
+        bounding window and vectorises it with GDAL, which is typically one to two
+        orders of magnitude faster. The boundary follows the same cell edges as
+        the union, so the result is equivalent. If GDAL polygonisation is
+        unavailable or fails for any reason, it falls back to the exact per-cell
+        union in dissolve_cells_to_geometry.
+        """
+        try:
+            ids = np.fromiter((int(c) for c in cell_ids), dtype=np.int64)
+            if ids.size == 0:
+                return QgsGeometry()
+            if self.geotransform is None or not self.cols:
+                return self.dissolve_cells_to_geometry(cell_ids)
+
+            cols = int(self.cols)
+            cell_rows = ids // cols
+            cell_cols = ids % cols
+            r0, r1 = int(cell_rows.min()), int(cell_rows.max())
+            c0, c1 = int(cell_cols.min()), int(cell_cols.max())
+            win_rows = r1 - r0 + 1
+            win_cols = c1 - c0 + 1
+
+            mask = np.zeros((win_rows, win_cols), dtype=np.uint8)
+            mask[cell_rows - r0, cell_cols - c0] = 1
+
+            gt = self.geotransform
+            win_gt = (
+                gt[0] + c0 * gt[1] + r0 * gt[2],
+                gt[1], gt[2],
+                gt[3] + c0 * gt[4] + r0 * gt[5],
+                gt[4], gt[5],
+            )
+
+            mem_ds = gdal.GetDriverByName("MEM").Create("", win_cols, win_rows, 1, gdal.GDT_Byte)
+            mem_ds.SetGeoTransform(win_gt)
+            if self.projection:
+                mem_ds.SetProjection(self.projection)
+            band = mem_ds.GetRasterBand(1)
+            band.WriteArray(mask)
+
+            ogr_ds = ogr.GetDriverByName("Memory").CreateDataSource("ddm_dissolve")
+            srs = None
+            if self.projection:
+                srs = osr.SpatialReference()
+                srs.ImportFromWkt(self.projection)
+            ogr_layer = ogr_ds.CreateLayer("catchment", srs=srs, geom_type=ogr.wkbPolygon)
+
+            # Using the band as its own mask means only value==1 pixels are
+            # collected, so no background polygon is produced.
+            gdal.Polygonize(band, band, ogr_layer, -1, [])
+
+            geoms = []
+            for feature in ogr_layer:
+                ogr_geom = feature.GetGeometryRef()
+                if ogr_geom is None:
+                    continue
+                qgis_geom = QgsGeometry.fromWkt(ogr_geom.ExportToWkt())
+                if qgis_geom is not None and not qgis_geom.isNull() and not qgis_geom.isEmpty():
+                    geoms.append(qgis_geom)
+
+            if not geoms:
+                return self.dissolve_cells_to_geometry(cell_ids)
+            if len(geoms) == 1:
+                return geoms[0]
+            return QgsGeometry.unaryUnion(geoms)
+        except Exception:
+            # Any GDAL/binding issue degrades gracefully to the exact union.
+            return self.dissolve_cells_to_geometry(cell_ids)
+
     def create_highlight_layer(self, upstream_cells):
         """Create or refresh a yellow line layer showing displayed upstream flow paths.
 
