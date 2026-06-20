@@ -41,6 +41,8 @@ from qgis.core import (
     QgsFillSymbol,
 )
 
+from .compat import enum_member
+
 
 class HydrologyBuildError(Exception):
     """Raised when the DEM cannot be converted into a usable flow graph."""
@@ -1418,12 +1420,13 @@ class D8HydrologyEngine:
             geom = self.dissolve_cells_to_geometry(cells)
             if geom.isNull() or geom.isEmpty():
                 continue
-            if QgsWkbTypes.geometryType(geom.wkbType()) != QgsWkbTypes.PolygonGeometry:
+            poly_geom = enum_member(QgsWkbTypes, "GeometryType", "PolygonGeometry")
+            if QgsWkbTypes.geometryType(geom.wkbType()) != poly_geom:
                 # Buffer by zero is a common GEOS nudge for polygonal geometry
                 # collections. If it still fails, skip the broken feature rather
                 # than showing thousands of individual cells.
                 fixed = geom.buffer(0, 1)
-                if not fixed.isNull() and not fixed.isEmpty() and QgsWkbTypes.geometryType(fixed.wkbType()) == QgsWkbTypes.PolygonGeometry:
+                if not fixed.isNull() and not fixed.isEmpty() and QgsWkbTypes.geometryType(fixed.wkbType()) == poly_geom:
                     geom = fixed
                 else:
                     continue
