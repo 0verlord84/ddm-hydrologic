@@ -1,7 +1,7 @@
 # DDM HydroLogic
 
 **From DEM to model-ready catchments in QGIS.**
-**Tested in QGIS v4.x**
+**Tested in QGIS 3.22 LTR and 4.x**
 
 Setting up a hydrologic model usually means a few hours of GIS prep work before the modelling even starts. DDM HydroLogic condenses some of the initial steps into one interactive session: it traces D8 flow paths from a DEM, ranks them by Strahler order, and lets you pick the relevant drainage. Draw an outlet line, set a minimum subcatchment size, and DDM HydroLogic cuts the catchment into dissolved subcatchment polygons — then you have choices of exporting as:
 
@@ -13,7 +13,7 @@ Setting up a hydrologic model usually means a few hours of GIS prep work before 
 
 It is important to note that all hydrological/hydraulic choices, such as rainfall, losses, Manning's coefficients, subcatchment types, etc.. have been deliberately left blank or default values.
 
-Current version: **1.0** · QGIS 4.x
+Current version: **2.0** · QGIS 3.22 LTR and 4.x
 
 ## Workflow
 
