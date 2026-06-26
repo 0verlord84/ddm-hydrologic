@@ -141,8 +141,7 @@ def _parse_reaches(lines: List[str]) -> List[dict]:
             # The plugin writer now deliberately uses blank reach names because
             # RORBwin accepted that format.  The importer therefore needs to
             # support both forms, otherwise it interprets us/ds nodes one column
-            # too far to the right and no QGIS link features are created. Tiny
-            # parsing trap, maximum annoyance.
+            # too far to the right and no QGIS link features are created.
             if len(parts) >= 11 and (not _looks_numeric(parts[1])):
                 name = parts[1]
                 us_node = _clean_node_ref(parts[2])

@@ -247,8 +247,7 @@ def _route_vector_lines(upstream: Dict[int, List[int]], downstream: Dict[int, in
     This mirrors the simple tree order used by RORB GE examples: upstream leaf
     basins use code 1, downstream basins that receive a running hydrograph use
     code 2, code 3 stores the running hydrograph at a confluence, and code 4
-    adds the next branch back to the stored hydrograph. Hydrology software really
-    did choose stack operations as a lifestyle.
+    adds the next branch back to the stored hydrograph.
     """
     lines: List[str] = ["1"]  # Reach types are taken from the graphical reach block.
     basin_order: List[int] = []

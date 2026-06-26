@@ -1034,7 +1034,7 @@ class DDMHydroLogicDock(QDockWidget):
             QMessageBox.warning(
                 self,
                 "Minimum subcatchment size required",
-                "Please input a Minimum subcatchment size greater than 0 m² before processing subcatchments. Your pc will be VERY grateful!",
+                "Please input a Minimum subcatchment size greater than 0 m² before processing subcatchments.",
             )
             self.status_label.setText("Minimum subcatchment size must be greater than 0 m².")
             return

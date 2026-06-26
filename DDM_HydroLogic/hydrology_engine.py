@@ -385,9 +385,8 @@ class D8HydrologyEngine:
             add_seed(int(seed_id) // cols, int(seed_id) % cols)
 
         if not heap:
-            # Extremely defensive fallback. A valid DEM with no boundary should
-            # not exist after the boundary mask above, but GIS formats are an
-            # endless source of character-building disappointment.
+            # Defensive fallback. A valid DEM with no boundary should not exist
+            # after the boundary mask above, but GIS formats vary.
             seed_id = min(self.valid_ids, key=lambda cid: float(self.dem[int(cid) // cols, int(cid) % cols]))
             add_seed(int(seed_id) // cols, int(seed_id) % cols)
 
@@ -476,7 +475,7 @@ class D8HydrologyEngine:
 
         # Stable outlet order: lowest filled/elevation outlets first. This does
         # not change the maths, but it keeps processing and layer creation
-        # deterministic, a rare kindness in GIS software.
+        # deterministic.
         outlet_ids = [int(i) for i in self.valid_ids if int(self.downstream[int(i)]) < 0]
         outlet_ids.sort(key=lambda cid: (float(self.filled_dem[cid // self.cols, cid % self.cols]), cid))
 
@@ -524,8 +523,7 @@ class D8HydrologyEngine:
                         self._emit(56 + 24 * processed / total_valid, "Accumulation and Strahler order")
 
         # Safety fallback for any valid cell not reached because of an unexpected
-        # malformed graph. This should not happen after the connectivity pass, but
-        # defensive code is cheaper than explaining a crash to QGIS users.
+        # malformed graph. This should not happen after the connectivity pass.
         missing = [int(i) for i in self.valid_ids if accumulation[int(i)] == 0]
         for cell_id in missing:
             accumulation[cell_id] = 1
@@ -643,8 +641,7 @@ class D8HydrologyEngine:
             stream_order[int(cell_id)] = int(max_order + 1 if child_orders.count(max_order) >= 2 else max_order)
 
         # Defensive fallback in case a malformed graph left a stream cell without
-        # processed upstream records. It should not occur, but QGIS users already
-        # suffer enough without mysterious missing attribute values.
+        # processed upstream records. It should not occur.
         for cell_id in displayed:
             stream_order.setdefault(int(cell_id), 1)
 
@@ -743,8 +740,7 @@ class D8HydrologyEngine:
                 except Exception:
                     continue
         except Exception:
-            # Fallback for partially initialised layers. Cartography should not be
-            # the reason processing fails, despite QGIS occasionally trying.
+            # Fallback for partially initialised layers.
             orders = set(int(v) for v in getattr(self, "display_strahler_by_cell", {}).values() if int(v) >= 1)
 
         orders = sorted(orders)
@@ -1123,8 +1119,7 @@ class D8HydrologyEngine:
         flow-path layer displays when **Display paths from accumulation** is
         greater than 1. Highlight only cells that actually exist as output
         flow-path features, otherwise the click tool draws hidden low-
-        accumulation lines back into existence. Computers love undoing UI
-        choices unless watched.
+        accumulation lines back into existence.
         """
         layer = QgsVectorLayer(
             f"LineString?crs={self._layer_crs_uri()}",
@@ -1207,7 +1202,7 @@ class D8HydrologyEngine:
         If the user drew an outlet/crossing line, only cells upstream of those
         crossings are processed. If no line was drawn, the whole valid DEM graph
         is processed. This keeps the drawn line useful without making it a
-        compulsory hoop, because software already has enough hoops.
+        compulsory step.
         """
         if boundary_outlet_cells:
             domain = set()
@@ -1266,8 +1261,7 @@ class D8HydrologyEngine:
                 kept.append((key, set(cell_set)))
 
         # A defensive second pass handles rare partial-overlap chains after the
-        # first merge pass. Hydrology graphs should not need it, but computers
-        # love creating edge cases as a lifestyle choice.
+        # first merge pass. Hydrology graphs should not need it.
         changed = True
         while changed:
             changed = False
@@ -1415,8 +1409,8 @@ class D8HydrologyEngine:
                 continue
 
             # Always dissolve DEM-cell polygons. Older builds fell back to
-            # collectGeometry for large catchments, which produced the cell-grid
-            # confetti the user quite reasonably objected to.
+            # collectGeometry for large catchments, which produced a cell-grid
+            # rather than a clean dissolved outline.
             geom = self.dissolve_cells_to_geometry(cells)
             if geom.isNull() or geom.isEmpty():
                 continue
