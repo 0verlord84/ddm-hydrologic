@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# DDM_HydroLogic: catchment delineation and hydrology/hydraulic model export for QGIS.
+# DDM HydroLogic: catchment delineation and hydrology/hydraulic model export for QGIS.
 # Copyright (C) 2026 Davide Di Mauro
 #
 # This program is free software: you can redistribute it and/or modify it under
