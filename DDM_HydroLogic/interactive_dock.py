@@ -122,8 +122,8 @@ class DDMHydroLogicDock(QDockWidget):
         dem_group = QGroupBox("DEM and flow path processing")
         dem_layout = QFormLayout(dem_group)
         dem_caution = QLabel(
-            "CAUTION: the lower the accumulation number, the busier and more computational demanding this process will get. "
-            "Example: for a 5m DEM a value of 5000 is a good starting point."
+            "CAUTION: the lower the accumulation number, the longer it gets. "
+            "Example: for a 5m DEM a value of 10,000 is a good starting point."
         )
         dem_caution.setWordWrap(True)
         dem_layout.addRow(dem_caution)
@@ -147,7 +147,7 @@ class DDMHydroLogicDock(QDockWidget):
         self.mask_btn = QPushButton("Create polygon")
         self.mask_btn.setToolTip(
             "Optional. Left-click to digitise a polygon on the map canvas. "
-            "The polygon is used as the boundary for all analyses."
+            "The polygon is used as the boundary for all processes."
         )
         dem_layout.addRow("3. Mask layer", self.mask_btn)
 
