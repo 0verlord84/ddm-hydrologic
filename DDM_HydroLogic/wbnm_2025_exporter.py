@@ -10,14 +10,14 @@
 """Write a WBNM runfile (.wbn) from the plugin's processed subcatchments.
 
 WBNM reads its runfiles by fixed columns and block markers, so this module
-only fills in what the GIS layers can honestly supply: the subarea topology,
+only fills in only the spatial information the QGIS layers can supply: the subarea topology,
 the surface areas, the catchment/outlet coordinates and which subareas need a
 natural stream segment. Rainfall, losses and structures are written as a
 clearly-labelled placeholder storm and empty structure blocks, leaving a
-complete but un-calibrated runfile that the modeller finishes in WBNM.
+complete but dummy runfile that the modeller finishes in WBNM.
 
 The runfile layout follows the WBNM2023 "Runfile Structure" document:
-  - exactly 8 lines in the preamble,
+  - 8 lines in the preamble,
   - two blank lines between blocks and none inside them,
   - 12-character fixed fields, with the downstream subarea name in the
     topology block starting in column 62.
@@ -42,19 +42,19 @@ class Wbnm2025ExportError(Exception):
 
 
 def _num(value: float, decimals: int = 2) -> str:
-    """Format one numeric field, right-justified in a 12-character column."""
+    """Formats one numeric field, right-justified in a 12-character column."""
     if not math.isfinite(value):
         value = 0.0
     return f"{value:{FIELD}.{decimals}f}"
 
 
 def _int(value: int) -> str:
-    """Format one integer field, right-justified in a 12-character column."""
+    """Formats one integer field, right-justified in a 12-character column."""
     return f"{int(value):{FIELD}d}"
 
 
 def _name(text: str) -> str:
-    """Format a subarea/gauge name, left-justified and clipped to 12 chars."""
+    """Formats a subarea/gauge name, left-justified and clipped to 12 chars."""
     return f"{str(text)[:FIELD]:<{FIELD}s}"
 
 
@@ -141,7 +141,7 @@ def _feature_centroid_xy(feat) -> Tuple[float, float]:
 
 
 def _catchment_centroid(features: Iterable[object]) -> Tuple[float, float]:
-    """Centre of gravity of the whole catchment, used in the display block."""
+    """Centroid of the whole catchment, used in the display block."""
     geoms = []
     for feat in features:
         try:
@@ -194,7 +194,7 @@ def _project_path() -> str:
 # --- working out the subarea network --------------------------------------
 
 def _downstream_map(engine, assignments, selected) -> Dict[int, Optional[int]]:
-    """Map each subarea outlet to the next downstream selected outlet, or None
+    """Maps each subarea outlet to the next downstream selected outlet, or None
     when it drains out of the model (the SINK)."""
     cell_to_outlet: Dict[int, int] = {}
     domain: set = set()
@@ -233,7 +233,7 @@ def _downstream_map(engine, assignments, selected) -> Dict[int, Optional[int]]:
 
 
 def _topological_order(ds_map, engine) -> List[int]:
-    """Order subareas upstream-to-downstream, as the topology block expects."""
+    """Orders subareas upstream-to-downstream, as the topology block expects."""
     depth_cache: Dict[int, int] = {}
 
     def depth(outlet_id: int) -> int:
@@ -296,7 +296,7 @@ def write_wbnm_2025_from_engine(
     global_eia_factor: float = 1.0,
     stream_lag_factor: float = 1.0,
 ) -> Tuple[str, int, float, int]:
-    """Write a first-pass WBNM 2025 ``.wbn`` runfile from the processed model.
+    """Writes a scaffolding WBNM 2025 ``.wbn`` runfile from the processed model.
 
     Returns ``(output_path, subarea_count, total_area_ha, flowpath_count)``.
     """
@@ -333,16 +333,16 @@ def write_wbnm_2025_from_engine(
     epsg = _epsg_code(engine)
     lines: List[str] = []
 
-    # 1. Preamble - exactly 8 lines of free text.
+    # 1. Preamble - 8 lines of free text.
     lines += _block(
         "#####START_PREAMBLE_BLOCK##########|###########|###########|###########|",
         [
             "First-pass WBNM 2025 runfile exported by the DDM HydroLogic QGIS plugin.",
             "Topology, subarea areas and stream segments are derived from the DEM.",
-            "Catchment and outlet coordinates come from the processed QGIS geometry.",
+            "Catchment and outlet coordinates come from the processed geometry.",
             "Subareas are listed upstream to downstream; the last one drains to SINK.",
-            "Rainfall is a single placeholder storm with zero depth - replace it.",
-            "Losses, imperviousness and structures are defaults - review them.",
+            "Rainfall is a single placeholder storm with zero depth - user to replace it.",
+            "Losses, imperviousness and structures are defaults - user to review them.",
             "Stream routing uses the natural lag factor 1.00 on every segment.",
             "Check the model in WBNM (WBNMCHCK/WBNMSORT) before using any results.",
         ],
@@ -356,7 +356,7 @@ def write_wbnm_2025_from_engine(
             output_path[:1024],
             f"Last Edit    ! {now:%d/%m/%Y}",
             "By           ! DDM HydroLogic QGIS plugin",
-            "2025_001     ! First-pass GIS export - check before modelling",
+            "2025_001     ! First-pass QGIS export - check before modelling",
         ],
         "#####END_STATUS_BLOCK##############|###########|###########|###########|",
     )
