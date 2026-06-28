@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# DDM HydroLogic: catchment delineation and hydrologic model export for QGIS.
+# DDM_HydroLogic: catchment delineation and hydrologic model export for QGIS.
 # Copyright (C) 2026 Davide Di Mauro
 #
 # This program is free software: you can redistribute it and/or modify it under
@@ -7,10 +7,10 @@
 # Foundation, either version 2 of the License, or (at your option) any later
 # version. It is distributed WITHOUT ANY WARRANTY. See the GNU General Public
 # License (the LICENSE file) for more details.
-"""Interactive DEM flow-path engine for DDM HydroLogic.
+"""Interactive DEM-to-flow paths engine for DDM HydroLogic.
 
 This module intentionally keeps the hydrology logic independent from the dock UI so
-it can be tested more easily inside QGIS. It builds a D8 graph directly from a DEM,
+it can be tested easily inside QGIS. It builds a D8 graph directly from a DEM,
 then exposes helpers for upstream tracing, outlet-line selection and vector export.
 """
 
@@ -99,7 +99,7 @@ class D8HydrologyEngine:
     # DEM reading and graph construction
     # ------------------------------------------------------------------
     def build(self):
-        """Read DEM data and build downstream, accumulation and Strahler arrays."""
+        """Read DEM data and build downstream, accumulation, and Strahler arrays."""
         self._read_dem()
         self._build_downstream_graph()
         self._build_upstream_accumulation_and_strahler()
@@ -113,7 +113,7 @@ class D8HydrologyEngine:
     def _check_cancelled(self):
         try:
             if self.cancel_callback():
-                raise HydrologyCancelled("Processing aborted by user.")
+                raise HydrologyCancelled("Process aborted by user.")
         except HydrologyCancelled:
             raise
         except Exception:
@@ -131,7 +131,7 @@ class D8HydrologyEngine:
 
         gt = ds.GetGeoTransform()
         if gt is None:
-            raise HydrologyBuildError("The DEM does not expose a GDAL geotransform.")
+            raise HydrologyBuildError("The DEM does not exposes a GDAL geotransform.")
         if abs(gt[2]) > 1e-12 or abs(gt[4]) > 1e-12:
             raise HydrologyBuildError(
                 "Rotated/skewed rasters are not supported by the interactive graph builder. "
@@ -164,7 +164,7 @@ class D8HydrologyEngine:
             valid = self._apply_analysis_mask_to_valid(valid)
 
         if not np.any(valid):
-            raise HydrologyBuildError("The DEM contains no valid cells after NoData and analysis-mask filtering.")
+            raise HydrologyBuildError("The DEM contains no valid cells!")
 
         self.valid = valid
         self.valid_ids = np.flatnonzero(valid.reshape(-1))
@@ -172,7 +172,7 @@ class D8HydrologyEngine:
         self._emit(12, f"DEM read: {self.cols} x {self.rows} cells{suffix}")
 
     def _combined_mask_geometry_in_dem_crs(self):
-        """Return the optional analysis mask geometry transformed to the DEM CRS."""
+        """Returns the optional analysis mask poly inheriting the DEM CRS."""
         layer = self.mask_layer
         if layer is None:
             return None
@@ -190,7 +190,7 @@ class D8HydrologyEngine:
                 if geom is not None and not geom.isNull() and not geom.isEmpty():
                     geoms.append(QgsGeometry(geom))
         except Exception as exc:
-            raise HydrologyBuildError(f"Could not read the analysis mask polygon: {exc}") from exc
+            raise HydrologyBuildError(f"Could not read the mask polygon: {exc}") from exc
 
         if not geoms:
             return None
@@ -212,11 +212,11 @@ class D8HydrologyEngine:
                 transform = QgsCoordinateTransform(source_crs, dest_crs, QgsProject.instance())
                 mask_geom.transform(transform)
         except Exception as exc:
-            raise HydrologyBuildError(f"Could not transform the analysis mask polygon to the DEM CRS: {exc}") from exc
+            raise HydrologyBuildError(f"Could not reproject the mask polygon to the DEM CRS: {exc}") from exc
         return mask_geom
 
     def _rasterize_mask_geometry(self, mask_geom):
-        """Rasterise a QGIS mask geometry onto the DEM grid using GDAL MEM."""
+        """Rasterises the mask poly onto the DEM using GDAL MEM."""
         try:
             mask_ds = gdal.GetDriverByName("MEM").Create("", int(self.cols), int(self.rows), 1, gdal.GDT_Byte)
             mask_ds.SetGeoTransform(self.geotransform)
@@ -236,7 +236,7 @@ class D8HydrologyEngine:
             feature = ogr.Feature(feature_defn)
             ogr_geom = ogr.CreateGeometryFromWkt(mask_geom.asWkt())
             if ogr_geom is None:
-                raise HydrologyBuildError("Could not convert the analysis mask geometry to OGR WKT.")
+                raise HydrologyBuildError("Could not convert the mask polygon to OGR WKT.")
             if ogr_geom.GetGeometryType() == ogr.wkbPolygon:
                 multi = ogr.Geometry(ogr.wkbMultiPolygon)
                 multi.AddGeometry(ogr_geom)
@@ -253,10 +253,10 @@ class D8HydrologyEngine:
         except HydrologyBuildError:
             raise
         except Exception as exc:
-            raise HydrologyBuildError(f"Could not rasterise the analysis mask polygon: {exc}") from exc
+            raise HydrologyBuildError(f"Could not rasterise the mask polygon: {exc}") from exc
 
     def _apply_analysis_mask_to_valid(self, valid):
-        """Restrict valid DEM cells to the optional user digitised mask polygon."""
+        """Restricts valid DEM cells to the (not so) optional user-digitised mask polygon."""
         mask_geom = self._combined_mask_geometry_in_dem_crs()
         if mask_geom is None:
             self.mask_layer = None
@@ -277,11 +277,11 @@ class D8HydrologyEngine:
         else:
             self.mask_nodata_cell_ids = []
         if self.mask_cell_count <= 0:
-            raise HydrologyBuildError("The analysis mask polygon does not overlap any valid DEM cells.")
+            raise HydrologyBuildError("The mask polygon does not overlaps with any valid DEM cells.")
         return filtered
 
     def inspect_analysis_mask_quality(self):
-        """Return a preflight summary of how the optional mask intersects the DEM.
+        """Returns a preflight summary of how the optional mask intersects the DEM.
 
         The dock uses this before full graph construction so the user can decide
         whether to continue when the digitised mask touches NoData/outside cells.
@@ -304,17 +304,17 @@ class D8HydrologyEngine:
         }
 
     def _build_downstream_graph(self):
-        """Build the D8 receiver graph using boundary-aware connectivity."""
+        """Builds the D8 receiver graph using boundary-aware connectivity."""
         self._build_downstream_graph_fill_connectivity()
 
     def _valid_boundary_mask(self):
-        """Return valid DEM cells that can behave as outlets.
+        """Returns valid DEM cells that can behave as outlets.
 
-        A clipped DEM often has a NoData frame around the real terrain. Boundary-aware
+        Didnt realise that a clipped DEM often has a NoData frame around real terrain pixels. Boundary-aware
         routing treats valid cells beside NoData as possible outlets rather than
         forcing the graph toward a single interior low point.
 
-        Boundary cells are therefore any valid cells on the raster edge OR any
+        Core logic for outlets - Boundary cells are any valid cells on the raster edge OR any
         valid cells touching NoData in the D8 neighbourhood.
         """
         valid = self.valid
@@ -343,12 +343,12 @@ class D8HydrologyEngine:
         return boundary
 
     def _priority_flood_connectivity_graph(self, progress_start=18, progress_span=34, message="Connecting D8 flow paths from low cells upstream"):
-        """Build a boundary-aware priority-flood receiver graph.
+        """Builds a boundary-aware priority-flood receiver graph.
 
         This helper is used by the full fill/connectivity mode and as a safety
         fallback for the pre-conditioned mode. It starts from every valid
         raster/mask boundary cell, not merely from the outside row/column of the
-        raster. That distinction matters for clipped DEMs with a NoData collar.
+        raster. That distinction matters for clipped DEM's with a NoData frame all around its bounds.
         """
         rows, cols = self.rows, self.cols
         downstream = np.full(rows * cols, -1, dtype=np.int64)
@@ -435,10 +435,10 @@ class D8HydrologyEngine:
         return downstream, filled, outlet_count, visit_order
 
     def _build_downstream_graph_fill_connectivity(self):
-        """Build a hydrologically connected D8 receiver graph.
+        """Builds a hydrologically connected D8 receiver graph.
 
         Uses a boundary-aware priority-flood pass. Valid cells adjacent to NoData
-        are seeded as outlets as well as valid cells on the outer raster edge.
+        are considered as outlets as well as valid cells on the outer raster edge.
         This avoids the old behaviour where a clipped DEM with a NoData border
         could be forced to drain everything to one global-low cell.
         """
@@ -454,7 +454,7 @@ class D8HydrologyEngine:
         self._emit(52, f"D8 connectivity complete. Boundary outlet cells: {outlet_count:,}")
 
     def _build_upstream_accumulation_and_strahler(self):
-        """Compute accumulation and Strahler order over the connected D8 graph.
+        """Computes accumulation and Strahler order over the connected D8 graph.
 
         The traversal is rooted at the lowest/outlet cells generated by the
         connectivity pass, then expands upstream through the receiver tree. Cell
@@ -474,7 +474,7 @@ class D8HydrologyEngine:
                 self.upstream[dst].append(int(src))
 
         # Stable outlet order: lowest filled/elevation outlets first. This does
-        # not change the maths, but it keeps processing and layer creation
+        # not change the calcs, but it keeps processing and layer creation
         # deterministic.
         outlet_ids = [int(i) for i in self.valid_ids if int(self.downstream[int(i)]) < 0]
         outlet_ids.sort(key=lambda cid: (float(self.filled_dem[cid // self.cols, cid % self.cols]), cid))
@@ -482,8 +482,8 @@ class D8HydrologyEngine:
         accumulation = np.zeros(n, dtype=np.int64)
         # Broad DEM-cell Strahler-style ordering is kept as a fallback/internal
         # diagnostic. Display and export Strahler order is recalculated later on
-        # the extracted stream network only, because official Strahler stream
-        # order applies to stream/channel links, not every DEM cell.
+        # the extracted stream network only (official Strahler stream
+        # order applies to stream/channel links, not every DEM cell).
         strahler = np.full(n, -1, dtype=np.int16)
         processed = 0
         total_valid = max(1, len(self.valid_ids))
@@ -523,7 +523,7 @@ class D8HydrologyEngine:
                         self._emit(56 + 24 * processed / total_valid, "Accumulation and Strahler order")
 
         # Safety fallback for any valid cell not reached because of an unexpected
-        # malformed graph. This should not happen after the connectivity pass.
+        # malformed output. This should not happen after the connectivity pass.
         missing = [int(i) for i in self.valid_ids if accumulation[int(i)] == 0]
         for cell_id in missing:
             accumulation[cell_id] = 1
@@ -564,7 +564,7 @@ class D8HydrologyEngine:
         return QgsGeometry.fromPolygonXY([ring])
 
     def point_to_cell_id(self, map_point, source_crs=None):
-        """Return the valid DEM cell id containing a map/canvas point.
+        """Returns the valid DEM cell id containing a map/canvas point.
 
         This is deliberately different from nearest_flow_cell(): CTRL-click
         deselection acts on the highlighted catchment polygon area, not the
@@ -596,7 +596,7 @@ class D8HydrologyEngine:
         authid = crs.authid()
         if authid:
             return authid
-        # Fallback. Most project DEMs should have an authid, but QGIS memory layers
+        # Fallback. Most project DEM's should have an authid, but QGIS memory layers
         # can still accept a WKT-style CRS URI in current versions.
         return crs.toWkt()
 
@@ -604,14 +604,14 @@ class D8HydrologyEngine:
     # Vector layer creation and styling
     # ------------------------------------------------------------------
     def _compute_stream_strahler_orders(self, displayed_cells):
-        """Compute classic 1-based Strahler order on the extracted stream network.
+        """Computes classic 1-based Strahler order on the extracted stream network.
 
         The DEM graph contains every valid raster cell. Strahler stream order,
         however, is defined on the extracted stream/channel network. Therefore
         this method works only on cells that will be displayed/exported as flow
         path features after the user's accumulation threshold is applied.
 
-        Rules implemented:
+        Disciplined:
         - channel/source links with no upstream channel link are Strahler 1;
         - if two or more upstream channel links of the maximum order meet, the
           downstream channel order increases by one;
@@ -649,7 +649,7 @@ class D8HydrologyEngine:
         return stream_order
 
     def create_flow_layer(self, min_accumulation=1):
-        """Create a temporary line layer containing cell-to-cell flow segments."""
+        """Creates a temporary line layer containing cell-to-cell flow segments."""
         self._emit(84, "Creating temporary flow-path line layer")
 
         layer = QgsVectorLayer(
@@ -729,7 +729,7 @@ class D8HydrologyEngine:
         return layer
 
     def _style_flow_layer(self, layer):
-        """Style flow paths in blues, with higher Strahler order darker/thicker."""
+        """Styles flow paths in blues, with higher Strahler order darker/thicker."""
         orders = set()
         try:
             for feat in layer.getFeatures():
@@ -764,16 +764,16 @@ class D8HydrologyEngine:
         layer.setRenderer(renderer)
 
     def create_reach_flow_layer(self):
-        """Create an export-only flow layer merged into same-order Strahler reaches.
+        """Creates an export-only flow layer merged into same-order Strahler reaches.
 
         The temporary display layer keeps one feature per DEM-cell segment for
         precise clicking. The final GeoPackage is cleaner: consecutive displayed
-        segments are merged while they share the same Strahler order. Cells with
-        Strahler order less than 1 are excluded. A lower-order tributary joining a
-        higher-order stem no longer fragments the higher-order stem, because the
-        Strahler hierarchy has not changed. Reaches are split where the same-order
-        sequence stops, where the downstream order changes, or where same-order
-        topology would be ambiguous.
+        segments are dissolved while they share the same Strahler order. Cells with
+        Strahler order less than 1 are excluded to reduce noise and computational impacts.
+        A lower-order tributary joining a higher-order stem no longer fragments 
+        the higher-order stem, because the Strahler hierarchy has not changed. 
+        Reaches are split where the same-order sequence stops, where the downstream order changes,
+        or where same-order topology would be ambiguous.
         """
         self._check_cancelled()
         if self.flow_layer is None:
@@ -792,11 +792,11 @@ class D8HydrologyEngine:
         if not displayed_cells:
             raise HydrologyBuildError("The temporary flow-path layer contains no displayed flow paths to export.")
 
-        # Recalculate from the displayed network as the source of truth in case a
+        # Recalculates from the displayed network as the source of truth in case a
         # stale temporary layer was created before the corrected Strahler logic.
         stream_order = self._compute_stream_strahler_orders(displayed_cells)
 
-        # Keep only valid Strahler streams. Proper Strahler order is 1-based; any
+        # Keeps only valid Strahler streams. Proper Strahler order is 1-based; any
         # zero/negative/blank order is either stale data or a malformed temporary
         # feature and must not leak into the final GeoPackage.
         displayed_cells = {
@@ -846,7 +846,7 @@ class D8HydrologyEngine:
             ]
 
         def can_merge_downstream(cell_id, next_cell):
-            """Return True if adjacent segments belong to the same Strahler reach.
+            """Returns True if adjacent segments belong to the same Strahler reach.
 
             This intentionally uses same-order topology, not total tributary
             count. A lower-order tributary entering a higher-order stem should not
@@ -993,7 +993,7 @@ class D8HydrologyEngine:
     # Upstream tracing and catchment construction
     # ------------------------------------------------------------------
     def collect_upstream(self, outlet_cell_id, limit=None):
-        """Return all upstream cells contributing to a nominated outlet cell."""
+        """Returns all upstream cells contributing to a nominated outlet cell."""
         outlet_cell_id = int(outlet_cell_id)
         result = []
         stack = [outlet_cell_id]
@@ -1011,7 +1011,7 @@ class D8HydrologyEngine:
         return result
 
     def dissolve_cells_to_geometry(self, cell_ids, chunk_size=10000):
-        """Return one dissolved polygon geometry for a collection of DEM cells.
+        """Returns one dissolved polygon geometry for a collection of DEM cells.
 
         The returned geometry is kept as a single QgsGeometry object for canvas
         overlays. It is deliberately not written to a QgsVectorLayer, so the
@@ -1040,7 +1040,7 @@ class D8HydrologyEngine:
         return QgsGeometry.unaryUnion(partials)
 
     def dissolve_cells_fast(self, cell_ids):
-        """Catchment-boundary polygon for the interactive overlay, the quick way.
+        """Catchment-boundary polygon for the interactive overlay.
 
         Unioning one square polygon per cell is slow for large catchments. This
         instead rasterises the selected cells into a small mask over just their
@@ -1113,11 +1113,11 @@ class D8HydrologyEngine:
             return self.dissolve_cells_to_geometry(cell_ids)
 
     def create_highlight_layer(self, upstream_cells):
-        """Create or refresh a yellow line layer showing displayed upstream flow paths.
+        """Creates or refreshes a yellow line layer showing displayed upstream flow paths.
 
         The DEM graph may contain many more upstream cells than the temporary
         flow-path layer displays when **Display paths from accumulation** is
-        greater than 1. Highlight only cells that actually exist as output
+        greater than 1. Highlights only cells that actually exist as output
         flow-path features, otherwise the click tool draws hidden low-
         accumulation lines back into existence.
         """
@@ -1197,7 +1197,7 @@ class D8HydrologyEngine:
         )
 
     def _domain_cells_for_subcatchments(self, boundary_outlet_cells=None):
-        """Return the DEM cells to subdivide into subcatchments.
+        """Returns the DEM cells to subdivide into subcatchments.
 
         If the user drew an outlet/crossing line, only cells upstream of those
         crossings are processed. If no line was drawn, the whole valid DEM graph
@@ -1213,10 +1213,10 @@ class D8HydrologyEngine:
         return set(int(c) for c in self.valid_ids)
 
     def normalize_overlapping_cell_groups(self, groups):
-        """Merge nested/overlapping catchment cell groups into parent groups.
+        """Merges nested/overlapping catchment cell groups into parent groups.
 
         Upstream catchments from a D8 tree should be either disjoint or nested.
-        If a user selects both a child and its downstream parent, drawing both
+        If the user selects both a child and it's downstream parent, drawing both
         creates overlapping catchment polygons. This normalisation keeps the
         larger/downstream parent group and merges any overlapping smaller child
         group into it. The result is a dictionary whose cell sets do not overlap.
@@ -1287,11 +1287,11 @@ class D8HydrologyEngine:
         return {int(key): set(cells) for key, cells in kept}
 
     def _normalise_assignments_no_overlap(self, assignments):
-        """British-spelled internal alias retained for readability in calls."""
+        """"""
         return {key: sorted(cells) for key, cells in self.normalize_overlapping_cell_groups(assignments).items()}
 
     def build_area_threshold_subcatchments(self, min_cells=1, boundary_outlet_cells=None, include_residual=True):
-        """Subdivide the selected DEM area into all target-size subcatchments.
+        """Subdivides the selected DEM area into all target-size subcatchments.
 
         The method walks cells from upstream to downstream. Unassigned residual
         area is accumulated along the D8 graph; once the residual area reaches
@@ -1330,7 +1330,7 @@ class D8HydrologyEngine:
                 pending_counts[down] += count
 
             if idx and idx % 50000 == 0:
-                self._emit(60 + 10 * idx / total, "Choosing minimum-size subcatchment outlets")
+                self._emit(60 + 10 * idx / total, "Chosing minimum-size subcatchment outlets")
 
         if not selected_outlets:
             return {}
@@ -1371,7 +1371,7 @@ class D8HydrologyEngine:
             if idx and idx % 50000 == 0:
                 self._emit(70 + 10 * idx / total, "Assigning DEM cells to subcatchment outlets")
 
-        # Drop any empty entries left by edge cases, then defensively normalise
+        # Drop any empty entries left by edge cases, then normalise
         # overlaps. The area assignment algorithm is designed to be cell-
         # disjoint already; this extra pass protects stale/outlet-edge cases and
         # keeps final polygons from overlapping.
@@ -1429,7 +1429,7 @@ class D8HydrologyEngine:
             # Recompute from the dissolved output geometry, equivalent to
             # QGIS expression fields using $area and $area / 10000. This avoids
             # disagreements between DEM-cell-count area and the final polygon
-            # geometry stored in the GeoPackage.
+            # geometry stored in the attribute table.
             area_m2 = round(float(geom.area()), 2)
             feat.setAttributes([
                 int(outlet_id),
