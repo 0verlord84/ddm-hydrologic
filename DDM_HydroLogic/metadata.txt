@@ -2,9 +2,9 @@
 name=DDM HydroLogic
 qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
-description=Delineate and create model-ready catchments interactively. Trace D8 flow paths, click the streams that matter, drop an outlet line, and export straight to GeoPackage, RORB, WBNM, XP-RAFTS or TUFLOW.
+description=Delineate and create model-ready catchments interactively. Trace D8 flow paths, selects the streams that matter, drop an outlet line, and export straight to GeoPackage, RORB, WBNM, XP-RAFTS or TUFLOW.
 version=2.0
-changelog=2.0 - QGIS 3.22 LTR support and a much faster interactive upstream-catchment overlay (GDAL polygonisation with per-catchment caching).
+changelog=2.0 - Back compatibility and support for earlier QGIS versions (Long Term Release 3.22) and a much faster interactive overlay.
     1.0 - First release
 author=Davide Di Mauro
 initials=DDM
