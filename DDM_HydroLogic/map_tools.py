@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# DDM HydroLogic: catchment delineation and hydrologic model export for QGIS.
+# DDM_HydroLogic: catchment delineation and hydrologic model export for QGIS.
 # Copyright (C) 2026 Davide Di Mauro
 #
 # This program is free software: you can redistribute it and/or modify it under
@@ -19,7 +19,7 @@ from .compat import enum_member, qt_enum
 
 
 class DrawOutletLineTool(QgsMapTool):
-    """Capture a user-drawn line: left click adds vertices, right click finishes."""
+    """Captures a user-drawn line: left click adds vertices, right click finishes."""
 
     lineFinished = pyqtSignal(list)
     cancelled = pyqtSignal()
@@ -72,7 +72,7 @@ class DrawOutletLineTool(QgsMapTool):
 
 
 class DrawMaskPolygonTool(QgsMapTool):
-    """Capture a user-drawn polygon: left click adds vertices, right click finishes."""
+    """Captures a user-drawn polygon: left click adds vertices, right click finishes."""
 
     polygonFinished = pyqtSignal(list)
     cancelled = pyqtSignal()
