@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# DDM HydroLogic: catchment delineation and hydrologic model export for QGIS.
+# DDM_HydroLogic: catchment delineation and hydrologic model export for QGIS.
 # Copyright (C) 2026 Davide Di Mauro
 #
 # This program is free software: you can redistribute it and/or modify it under
@@ -198,7 +198,7 @@ def _parse_reaches(lines: List[str]) -> List[dict]:
 
 
 def load_rorb_catg_layers(path: str, crs_uri: str = "") -> Tuple[QgsVectorLayer, QgsVectorLayer]:
-    """Load RORB GE .catg graphical nodes/reaches into temporary memory layers."""
+    """Loads RORB GE .catg graphical nodes/reaches into temporary memory layers."""
     if not path or not os.path.exists(path):
         raise RorbCatgImportError("The selected .catg file does not exist.")
 
