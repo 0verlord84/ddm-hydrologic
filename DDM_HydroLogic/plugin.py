@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# DDM HydroLogic: catchment delineation and hydrologic model export for QGIS.
+# DDM_HydroLogic: catchment delineation and hydrologic model export for QGIS.
 # Copyright (C) 2026 Davide Di Mauro
 #
 # This program is free software: you can redistribute it and/or modify it under
@@ -20,7 +20,7 @@ from .interactive_dock import DDMHydroLogicDock
 
 
 class DDMHydroLogicPlugin:
-    """Expose the interactive DDM HydroLogic dock tool."""
+    """Exposes the interactive DDM HydroLogic dock tool."""
 
     MENU_NAME = "&DDM HydroLogic"
 
@@ -61,7 +61,7 @@ class DDMHydroLogicPlugin:
             self.open_dock_action = None
 
     def show_dock(self):
-        """Open or raise the interactive DDM HydroLogic dock."""
+        """Opens or raises the interactive DDM HydroLogic dock."""
         if self.dock is None:
             self.dock = DDMHydroLogicDock(self.iface)
             self.iface.addDockWidget(qt_enum(Qt, "DockWidgetArea", "RightDockWidgetArea"), self.dock)
