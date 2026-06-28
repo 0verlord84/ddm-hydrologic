@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# DDM HydroLogic: catchment delineation and hydrologic model export for QGIS.
+# DDM_HydroLogic: catchment delineation and hydrologic model export for QGIS.
 # Copyright (C) 2026 Davide Di Mauro
 #
 # This program is free software: you can redistribute it and/or modify it under
@@ -10,15 +10,15 @@
 """Write the standard TUFLOW region shapefiles from the processed subcatchments.
 
 A TUFLOW 2D model reads most of its spatial inputs from GIS layers whose names
-follow the ``2d_<type>_<scenario>_R`` convention (the ``_R`` marks a region, i.e.
-polygon, layer). This exporter dissolves all processed subcatchments into one
+follow the ``2d_<type>_<scenario>_R`` convention (the ``_R`` marks a region/
+polygon layer). This exporter dissolves all processed subcatchments into one
 topologically valid catchment boundary polygon and writes that single feature
-into each of the seven region layers a model setup usually starts from:
+into some of the most popular region layers a model setup usually starts from:
 
     2d_code   active-area code polygon (Code = 1, the cells TUFLOW computes)
     2d_loc    model location/orientation region
-    2d_mat    materials (roughness) region - Material left blank to fill in
-    2d_soil   soils region - SoilID left blank to fill in
+    2d_mat    materials region (roughness n coeff) - Values left blank for user to fill in
+    2d_soil   soils region - SoilID left blank for user to fill in
     2d_rf     direct-rainfall region (Name plus the f1/f2 multipliers)
     2d_po     plot-output region - Type/Label/Comment left blank
     2d_qnl    quadtree nesting-level region - Nest_Level left blank
@@ -53,7 +53,7 @@ _FIELD_TYPES = {
     "double": (QVariant.Double, "double"),
 }
 
-# The seven region layers, written exactly to the TUFLOW data formats:
+# The region layers, written exactly to the TUFLOW data formats:
 # (base filename, [(field, kind, width, precision)], [attribute values]).
 # A None value writes NULL, which a shapefile shows as a blank cell.
 # Code is an integer field, so "001" is stored as the integer 1 - DBF integer
@@ -88,7 +88,7 @@ class TuflowExportError(Exception):
 
 
 def _writer_no_error_code():
-    """Return the vector-writer success code for QGIS 3 or QGIS 4."""
+    """Returns the vector-writer success code for QGIS 3 or QGIS 4."""
     if hasattr(QgsVectorFileWriter, "NoError"):
         return QgsVectorFileWriter.NoError
     writer_error = getattr(QgsVectorFileWriter, "WriterError", None)
@@ -154,7 +154,7 @@ def _dem_crs(engine):
 # --- building the boundary polygon -----------------------------------------
 
 def _dissolved_boundary(features: Iterable[object]) -> "QgsGeometry":
-    """Merge all subcatchment polygons into one valid multipolygon boundary."""
+    """Merges all subcatchment polygons into one valid multipolygon boundary."""
     geoms: List[QgsGeometry] = []
     for feat in features:
         try:
@@ -204,7 +204,7 @@ def _dissolved_boundary(features: Iterable[object]) -> "QgsGeometry":
 
 
 def _transform_to_dem_crs(geometry: "QgsGeometry", source_layer, dem_crs) -> "QgsGeometry":
-    """Reproject the boundary into the DEM CRS when the layers ever diverge."""
+    """Reprojects the boundary into the DEM CRS when the layers ever diverge."""
     if dem_crs is None:
         return geometry
     try:
@@ -279,7 +279,7 @@ def write_tuflow_from_engine(
     assignments: Dict[int, Iterable[int]],
     output_dir: str,
 ) -> Tuple[str, List[str], float]:
-    """Write the seven first-pass TUFLOW region shapefiles into ``output_dir``.
+    """Writes first-pass TUFLOW region shapefiles into ``output_dir``.
 
     Returns ``(output_dir, written_paths, total_area_ha)``.
     """
