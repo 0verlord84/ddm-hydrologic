@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# DDM HydroLogic: catchment delineation and hydrologic model export for QGIS.
+# DDM_HydroLogic: catchment delineation and hydrologic model export for QGIS.
 # Copyright (C) 2026 Davide Di Mauro
 #
 # This program is free software: you can redistribute it and/or modify it under
@@ -7,11 +7,7 @@
 # Foundation, either version 2 of the License, or (at your option) any later
 # version. It is distributed WITHOUT ANY WARRANTY. See the GNU General Public
 # License (the LICENSE file) for more details.
-"""Compatibility helpers for QGIS 3/PyQt5 and QGIS 4/PyQt6 enum names.
-
-QGIS 4 uses PyQt6-style scoped enums in several places. These helpers allow the
-same plugin code to run against older flat enum names and newer scoped names.
-"""
+"""Compatibility helpers for QGIS 3/PyQt5 and QGIS 4/PyQt6 enum names."""
 
 
 def qt_enum(parent, scoped_group_name, member_name):
