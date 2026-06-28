@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# DDM HydroLogic: catchment delineation and hydrologic model export for QGIS.
+# DDM_HydroLogic: catchment delineation and hydrologic model export for QGIS.
 # Copyright (C) 2026 Davide Di Mauro
 #
 # This program is free software: you can redistribute it and/or modify it under
@@ -64,7 +64,7 @@ from .xprafts_exporter import XpRaftsExportError, write_xprafts_from_engine
 
 
 def _writer_no_error_code():
-    """Return the vector-writer success code for QGIS 3 or QGIS 4."""
+    """Returns the vector-writer success code for QGIS 3 or QGIS 4."""
     if hasattr(QgsVectorFileWriter, "NoError"):
         return QgsVectorFileWriter.NoError
     writer_error = getattr(QgsVectorFileWriter, "WriterError", None)
