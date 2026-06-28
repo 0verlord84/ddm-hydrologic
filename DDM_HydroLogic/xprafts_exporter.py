@@ -9,15 +9,15 @@
 # License (the LICENSE file) for more details.
 """Write an XP-RAFTS exchange file (.xpx) from the processed subcatchments.
 
-XP-RAFTS stores a model in a binary-ish ``.xp`` project, but it imports and
+XP-RAFTS stores a model in a pseudo-binary ``.xp`` project, but it imports and
 exports an ASCII *XP eXchange* file (``.xpx``) for moving model data in and out.
 That exchange file is the one external tools produce, so this exporter writes an
 ``.xpx`` that XP-RAFTS can import (File > Import > XPX) to build the catchment.
 
-What the GIS can supply is written for real - one RAFTS node per subcatchment
+What QGIS can supply: one RAFTS node per subcatchment
 (named, with easting/northing), one link per drainage connection, and the
 sub-area area in hectares. Everything else (roughness, slope, baseflow, outlet
-structures, storms) is written as a clearly-defined default for the modeller to
+structures, storms) is written as a clearly-defined default for the user to
 calibrate in XP-RAFTS.
 
 The XPX grammar (see the XP-RAFTS reference manual, "XPX Command Reference"):
@@ -218,7 +218,7 @@ def _feature_centroid_xy(feat) -> Tuple[float, float]:
 
 
 def _downstream_map(engine, assignments, selected) -> Dict[int, Optional[int]]:
-    """Map each subarea outlet to the next downstream selected outlet, or None
+    """Maps each subarea outlet to the next downstream selected outlet, or None
     when it drains out of the model."""
     cell_to_outlet: Dict[int, int] = {}
     domain: set = set()
@@ -256,7 +256,7 @@ def _downstream_map(engine, assignments, selected) -> Dict[int, Optional[int]]:
 
 
 def _topological_order(ds_map, engine) -> List[int]:
-    """Order subareas upstream-to-downstream so nodes precede their links."""
+    """Orders subareas upstream-to-downstream so nodes precede their links."""
     depth_cache: Dict[int, int] = {}
 
     def depth(outlet_id: int) -> int:
@@ -322,7 +322,7 @@ def write_xprafts_from_engine(
     pervious_mannings_n: float = 0.035,
     subarea_slope_pct: float = 0.70,
 ) -> Tuple[str, int, int, float]:
-    """Write a first-pass XP-RAFTS ``.xpx`` exchange file.
+    """Writes a scaffolding XP-RAFTS ``.xpx`` exchange file.
 
     Returns ``(output_path, node_count, link_count, total_area_ha)``.
     """
