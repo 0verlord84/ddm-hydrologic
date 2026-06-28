@@ -1,17 +1,17 @@
 # DDM HydroLogic
 
 **From DEM to model-ready catchments in QGIS.**
-**Tested in QGIS 3.22 LTR and 4.x**
+**Now compatible with QGIS 3.22 LTR and 4.x**
 
 Setting up a hydrologic model usually means a few hours of GIS prep work before the modelling even starts. DDM HydroLogic condenses some of the initial steps into one interactive session: it traces D8 flow paths from a DEM, ranks them by Strahler order, and lets you pick the relevant drainage. Draw an outlet line, set a minimum subcatchment size, and DDM HydroLogic cuts the catchment into dissolved subcatchment polygons — then you have choices of exporting as:
 
-- **GeoPackage** of flow paths and subcatchments,
+- **GeoPackage** containing flow path and subcatchment vectors,
 - **RORB** `.catg` GE-ready catchment file,
 - **WBNM** `.wbn` runfile,
 - **XP-RAFTS** `.xpx` exchange file,
 - or some of the most popular **TUFLOW** xxx_R.shp.
 
-It is important to note that all hydrological/hydraulic choices, such as rainfall, losses, Manning's coefficients, subcatchment types, etc.. have been deliberately left blank or default values.
+It is important to note that all hydrological/hydraulic choices, such as rainfall, losses, Manning's coefficients, subcatchment types, impervious fractions, etc.. have been deliberately left blank or default values.
 
 Current version: **2.0** · QGIS 3.22 LTR and 4.x
 
@@ -32,7 +32,7 @@ Current version: **2.0** · QGIS 3.22 LTR and 4.x
 - **Export to RORB (.catg)** writes a first-pass RORBwin/RORB GE `.catg` file using a self-contained connected node-link writer. The drawn outlet line is used to create the explicit RORB outlet node where available, and the export validates that every node drains to that outlet before writing (tested in RORB v6.52). DDM HydroLogic automatically loads temporary **RORB nodes** and **RORB links**.
 - **Export to WBNM 2025 (.wbn)** writes a first-pass WBNM runfile (see notes below).
 - **Export to XP-RAFTS (.xpx)** writes a first-pass XP-RAFTS exchange file (see notes below).
-- **Export TUFLOW files (.shp)** writes TUFLOW regions shp into a chosen folder. The final catchment will be included the scaffolding of the following: 2d_code, 2d_loc, 2d_rf, 2d_po, 2d_mat, 2d_qnl and 2d_soil.
+- **Export TUFLOW files (.shp)** writes TUFLOW regions shp into a chosen folder. The final catchment will be included in the scaffoldings of the following: 2d_code, 2d_loc, 2d_rf, 2d_po, 2d_mat, 2d_qnl and 2d_soil.
 
 ## WBNM 2025 export notes
 
@@ -42,7 +42,7 @@ catchment/outlet coordinates and EPSG, and which subareas need a natural stream
 segment. The file is laid out to the WBNM2023 runfile structure — exactly eight
 preamble lines, two blank lines between blocks, 12-character fixed fields, and the
 downstream subarea name in column 62 of each topology row — so it opens cleanly in
-WBNM and its GUI tools.
+WBNM and it's GUI tools.
 
 Rainfall is written as a single placeholder storm of zero depth, and the
 local/outlet structure blocks are empty. Open the runfile in WBNM, replace the
@@ -52,11 +52,11 @@ WBNMCHCK/WBNMSORT before relying on any results.
 ## XP-RAFTS export notes
 
 DDM HydroLogic writes one RAFTS node per subcatchment (named, with easting/northing
-from the QGIS geometry), one link per drainage connection, and the sub-area area
+captured from the geometry), one link per drainage connection, and the sub-area area
 in hectares. Each node carries the five RAFTS sub-area slots, with slot 0 holding
 the real sub-area and slots 1–4 as inert placeholders. Manning's coeff, sub-area slope, channel routing, losses and storms are written
-as defaults — review them in XP-RAFTS before running. No design storms are
-selected, so the imported model has geometry only and waits for rainfall.
+as defaults — It's highly recommended to review them in XP-RAFTS before running. No design storms are
+selected, so the imported model shows only geometries.
 
 ## TUFLOW export notes
 
