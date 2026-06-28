@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# DDM HydroLogic: catchment delineation and hydrologic model export for QGIS.
+# DDM_HydroLogic: catchment delineation and hydrologic model export for QGIS.
 # Copyright (C) 2026 Davide Di Mauro
 #
 # This program is free software: you can redistribute it and/or modify it under
@@ -7,7 +7,7 @@
 # Foundation, either version 2 of the License, or (at your option) any later
 # version. It is distributed WITHOUT ANY WARRANTY. See the GNU General Public
 # License (the LICENSE file) for more details.
-"""RORBwin .catg exporter for DDM HydroLogic.
+"""RORBwin GE .catg exporter for DDM HydroLogic.
 
 This module converts the plugin's generated subcatchments and D8 flow graph into
 an initial RORB GE/RORBwin graphical catchment file. The writer is deliberately
@@ -51,7 +51,7 @@ def _safe_layer_field(feat, name: str, default=None):
 
 
 def _feature_area_m2(feat) -> float:
-    """Return final polygon area in m² from geometry, falling back to attributes."""
+    """Returns final polygon area in m² from geometry, falling back to attributes."""
     try:
         geom = feat.geometry()
         if geom is not None and not geom.isNull() and not geom.isEmpty():
@@ -70,7 +70,7 @@ def _feature_area_m2(feat) -> float:
 
 
 def _feature_impervious_fraction(feat, field_name: str | None = None, default: float = 0.0) -> float:
-    """Return a safe RORB impervious fraction from feature attributes or the default."""
+    """Returns a safe RORB impervious fraction from feature attributes or the default."""
     if not field_name:
         return max(0.0, min(1.0, float(default or 0.0)))
     value = default
@@ -155,7 +155,7 @@ def _midpoint(points: Sequence[Tuple[float, float]]) -> Tuple[float, float]:
 
 
 def _walk_downstream_path(engine, start_cell: int, selected_outlets: set[int], domain_cells: set[int], model_outlet_cell: Optional[int] = None):
-    """Walk from a subcatchment outlet to the next selected outlet or model outlet.
+    """Walks from a subcatchment outlet to the next selected outlet or model outlet.
 
     Returns ``(path_points, downstream_selected_outlet, terminal_point)``.
     If ``downstream_selected_outlet`` is ``None``, the reach is terminal and is
@@ -204,7 +204,7 @@ def _walk_downstream_path(engine, start_cell: int, selected_outlets: set[int], d
 
 
 def _normalise_graphical_coordinates(nodes: Dict[int, dict], reaches: List[dict]) -> Tuple[Dict[int, Tuple[float, float]], Dict[int, Tuple[float, float]]]:
-    """Scale actual CRS coordinates into the 0-100-ish RORB GE display window."""
+    """Scales actual CRS coordinates into the 0-100-ish RORB GE display window."""
     xs: List[float] = []
     ys: List[float] = []
     for node in nodes.values():
@@ -242,7 +242,7 @@ def _format_table(values: Sequence[float], decimals: int = 3) -> str:
 
 
 def _route_vector_lines(upstream: Dict[int, List[int]], downstream: Dict[int, int], reach_by_us: Dict[int, dict], outlet_node_id: int):
-    """Build RORB calculation/control lines and basin area order.
+    """Builds RORB calculation/control lines and basin area order.
 
     This mirrors the simple tree order used by RORB GE examples: upstream leaf
     basins use code 1, downstream basins that receive a running hydrograph use
@@ -400,7 +400,7 @@ def write_rorb_catg_from_engine(
     outlet_name: str = "outlet",
     model_outlet_cell: Optional[int] = None,
 ) -> Tuple[str, int, int]:
-    """Write a RORBwin/RORB GE .catg file from plugin outputs.
+    """Writes a RORBwin/RORB GE .catg file from plugin outputs.
 
     The exported graph is explicitly validated so every basin node has one
     downstream chain ending at the single model outlet node. If an outlet line
