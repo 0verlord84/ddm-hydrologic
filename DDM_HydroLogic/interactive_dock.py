@@ -379,7 +379,7 @@ class DDMHydroLogicDock(QDockWidget):
         self._clear_outlet_line_overlay()
         gc.collect()
         self.progress.setValue(0)
-        self.status_label.setText("Flow-path processing cancelled. Analysis mask and temporary plugin outputs were cleared; reproject the DEM or select Yes to proceed with the current CRS.")
+        self.status_label.setText("Flow-path processing cancelled. Mask polygon and temporary plugin outputs were cleared; reproject the DEM or select Yes to proceed with the current CRS.")
 
     def _canvas_crs_uri(self):
         crs = self.canvas.mapSettings().destinationCrs()
@@ -694,7 +694,7 @@ class DDMHydroLogicDock(QDockWidget):
             layer.updateFields()
             feat = QgsFeature(layer.fields())
             feat.setGeometry(geom)
-            feat.setAttributes(["NoData cells intersect the analysis mask"])
+            feat.setAttributes(["NoData cells intersect the mask polygon"])
             provider.addFeatures([feat])
             layer.updateExtents()
             symbol = QgsFillSymbol.createSimple({
