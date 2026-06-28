@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# DDM HydroLogic: catchment delineation and hydrologic model export for QGIS.
+# DDM_HydroLogic: catchment delineation and hydrology/hydraulic model export for QGIS.
 # Copyright (C) 2026 Davide Di Mauro
 #
 # This program is free software: you can redistribute it and/or modify it under
@@ -22,7 +22,7 @@ class _DDMHydroLogicLoadFailurePlugin:
             from qgis.PyQt.QtWidgets import QMessageBox
             QMessageBox.critical(self.iface.mainWindow(), "DDM HydroLogic could not start", self.message)
         except Exception:
-            # If Qt itself is unavailable, QGIS will still show the original Python console traceback.
+            # If Qt itself is unavailable, QGIS will still shows the original Python console traceback.
             pass
 
     def unload(self):
