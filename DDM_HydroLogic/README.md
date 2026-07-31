@@ -6,6 +6,10 @@
 1. Retro compatibility with QGIS 3.22 LTR (tested on v3.22.16)
 2. Faster sub catchment processing and selection
 
+**v2.1 now features:**
+1. Export to URBS (.vec routing file and .csv catchment data file)
+2. Multiple outlet lines can be drawn for multi-outlet models
+
 **INTRO**
 
 Setting up a hydrologic model usually means a few hours of GIS prep work before the modelling even starts. DDM HydroLogic condenses some of the initial steps into one interactive session: it traces D8 flow paths from a DEM, ranks them by Strahler order, and lets you pick the relevant drainage. Draw an outlet line, set a minimum subcatchment size, and DDM HydroLogic cuts the catchment into dissolved subcatchment polygons — then you have choices of exporting as:
@@ -18,7 +22,7 @@ Setting up a hydrologic model usually means a few hours of GIS prep work before 
 
 It is important to note that all hydrological/hydraulic choices, such as rainfall, losses, Manning's coefficients, subcatchment types, impervious fractions, etc.. have been deliberately left blank or default values.
 
-Current version: **2.0** · QGIS 3.22 LTR and 4.x
+Current version: **2.1** · QGIS 3.22 LTR and 4.x
 
 ## Workflow
 
@@ -38,6 +42,7 @@ Current version: **2.0** · QGIS 3.22 LTR and 4.x
 - **Export to WBNM 2025 (.wbn)** writes a first-pass WBNM runfile (see notes below).
 - **Export to XP-RAFTS (.xpx)** writes a first-pass XP-RAFTS exchange file (see notes below).
 - **Export TUFLOW files (.shp)** writes TUFLOW regions shp into a chosen folder. The final catchment will be included in the scaffoldings of the following: 2d_code, 2d_loc, 2d_rf, 2d_po, 2d_mat, 2d_qnl and 2d_soil.
+- **Export to URBS (.vec/.csv)** writes a URBS routing vector file and catchment data file into a chosen folder (see notes below).
 
 ## WBNM 2025 export notes
 
@@ -71,8 +76,20 @@ valid catchment polygon and writes it into each shapefile retaining the same CRS
 The filenames use the `s1_s2_e1_e2_e3_EXG_001` scenario/event placeholder name.
 Field names, types, widths and precisions follow the TUFLOW 2026.0.0 data formats.
 
+## URBS export notes
+
+DDM HydroLogic writes two URBS input files into a chosen folder: a routing vector
+file (`URBS_RoutingFile.vec`) and a catchment data file (`URBS_SubcatFile.csv`).
+The routing file lists the subareas as RAIN / ADD RAIN / ROUTE THRU commands with
+STORE. / GET. branch markers, and multiple outlets are supported. Reach lengths (L)
+and channel slopes (Sc) come from each subarea's main channel; the catchment slope
+(CS) is the equal-area slope from the subarea high point down to its outlet.
+Land-use fractions (U, UF, I) are read from FracUrban/FracForest/FracImp fields if
+the subcatchment layer has them, otherwise written as zero. Losses and model
+parameters are left as defaults to complete in URBS.
+
 ## Scripting maintenance notes
 
-- The RORB, WBNM, XP-RAFTS and TUFLOW exporters live in their own modules; the main just calls them.
+- The RORB, WBNM, XP-RAFTS, TUFLOW and URBS exporters live in their own modules; the main just calls them.
 - Startup and runtime failures report whether a Python module or a plugin file is missing, so hopefully it's clear what to install.
 - WBNM export reads the engine's flow-accumulation values whether they are stored in a dict or a NumPy array.

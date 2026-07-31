@@ -61,6 +61,7 @@ from .rorb_catg_importer import load_rorb_catg_layers
 from .tuflow_exporter import TUFLOW_LAYERS, TuflowExportError, write_tuflow_from_engine
 from .wbnm_2025_exporter import Wbnm2025ExportError, write_wbnm_2025_from_engine
 from .xprafts_exporter import XpRaftsExportError, write_xprafts_from_engine
+from .urbs_exporter import UrbsExportError, write_urbs_from_engine
 
 
 def _writer_no_error_code():
@@ -96,6 +97,8 @@ class DDMHydroLogicDock(QDockWidget):
         self.outlet_line_band = None
         self.outlet_line_points = []
         self.outlet_line_layer_geom = None
+        self.outlet_line_geoms = []
+        self.outlet_line_bands = []
         self.dem_layer_ids = []
         self.abort_requested = False
         self.active_operation = None
@@ -122,7 +125,7 @@ class DDMHydroLogicDock(QDockWidget):
         dem_group = QGroupBox("DEM and flow path processing")
         dem_layout = QFormLayout(dem_group)
         dem_caution = QLabel(
-            "CAUTION: the lower the accumulation number, the longer it gets. "
+            "CAUTION: lower accumulation numbers increase processing time. "
             "Example: for a 5m DEM a value of 10,000 is a good starting point."
         )
         dem_caution.setWordWrap(True)
@@ -182,8 +185,8 @@ class DDMHydroLogicDock(QDockWidget):
         self.draw_subcatchment_hint.setWordWrap(True)
         sub_layout.addRow(self.draw_subcatchment_hint)
 
-        self.draw_btn = QPushButton("6. Draw outlet line")
-        self.clear_outlet_btn = QPushButton("Clear outlet line")
+        self.draw_btn = QPushButton("6. Draw outlet line(s)")
+        self.clear_outlet_btn = QPushButton("Clear outlet line(s)")
         outlet_row = QHBoxLayout()
         outlet_row.addWidget(self.draw_btn, 1)
         outlet_row.addWidget(self.clear_outlet_btn, 1)
@@ -211,7 +214,7 @@ class DDMHydroLogicDock(QDockWidget):
         sub_layout.addRow(process_row)
         layout.addWidget(sub_group)
 
-        export_group = QGroupBox("Final output")
+        export_group = QGroupBox("Final outputs")
         export_layout = QVBoxLayout(export_group)
         self.export_btn = QPushButton("Export flow paths and subcatchments to GeoPackage")
         export_layout.addWidget(self.export_btn)
@@ -243,6 +246,14 @@ class DDMHydroLogicDock(QDockWidget):
             "(same CRS as DEM)."
         )
         export_layout.addWidget(self.tuflow_export_btn)
+
+        self.urbs_export_btn = QPushButton("Export to URBS (.vec/.csv)")
+        self.urbs_export_btn.setToolTip(
+            "Writes a URBS routing vector file (.vec) and catchment data file (.csv) into a chosen folder, "
+            "from current subcatchments, topology, areas and reach lengths/slopes. Supports multiple outlets. "
+            "Losses and model parameters are left as defaults to edit in URBS."
+        )
+        export_layout.addWidget(self.urbs_export_btn)
         layout.addWidget(export_group)
 
         self.abort_btn = QPushButton("Abort current plugin process and clear memory")
@@ -277,6 +288,7 @@ class DDMHydroLogicDock(QDockWidget):
         self.wbnm_export_btn.clicked.connect(self.export_wbnm_2025)
         self.xprafts_export_btn.clicked.connect(self.export_xprafts)
         self.tuflow_export_btn.clicked.connect(self.export_tuflow)
+        self.urbs_export_btn.clicked.connect(self.export_urbs)
         self.clear_btn.clicked.connect(self.clear_temporary_layers)
         self.abort_btn.clicked.connect(self.request_abort)
 
@@ -818,6 +830,7 @@ class DDMHydroLogicDock(QDockWidget):
             self.wbnm_export_btn,
             self.xprafts_export_btn,
             self.tuflow_export_btn,
+            self.urbs_export_btn,
         ):
             widget.setEnabled(not busy)
         self.abort_btn.setEnabled(bool(busy))
@@ -988,22 +1001,26 @@ class DDMHydroLogicDock(QDockWidget):
     def _handle_drawn_line(self, points):
         if not self._require_engine_and_layer() or len(points) < 2:
             return
-        self._update_outlet_line_overlay(points)
         layer_points = self.engine.transform_polyline(
             points,
             self.canvas.mapSettings().destinationCrs(),
             self.engine.flow_layer.crs(),
         )
         geom = QgsGeometry.fromPolylineXY([QgsPointXY(p) for p in layer_points])
+        if not self._flow_cells_crossed_by_outlet_geometry(geom):
+            self.status_label.setText("The drawn line did not cross any displayed flow-path cells; it was not added.")
+            return
+        # Accumulate this outlet line alongside any previously drawn ones.
+        self.outlet_line_geoms.append(QgsGeometry(geom))
         self.outlet_line_layer_geom = QgsGeometry(geom)
-        self.outlet_cells = self._flow_cells_crossed_by_outlet_geometry(geom)
+        self._update_outlet_line_overlay(points)
+        self.outlet_cells = self._outlet_cells_union()
         self.current_assignments = {}
         self._remove_layer_if_present("subcatchment_layer")
-        if not self.outlet_cells:
-            self.status_label.setText("The drawn line did not cross any displayed flow-path cells.")
-            return
+        line_count = len(self.outlet_line_geoms)
         self.status_label.setText(
-            f"Outlet line captured. It crossed {len(self.outlet_cells):,} displayed flow-path cells. "
+            f"Outlet line captured. {line_count} outlet line(s) recorded, crossing "
+            f"{len(self.outlet_cells):,} displayed flow-path cells in total. "
             "Press Process subcatchments to generate the preview/output polygons."
         )
 
@@ -1110,8 +1127,7 @@ class DDMHydroLogicDock(QDockWidget):
             self._set_busy(False)
 
     def _update_outlet_line_overlay(self, points):
-        """Shows the outlet/crossing line as a thick red canvas overlay, not as a project layer."""
-        self._clear_outlet_line_overlay()
+        """Adds a thick red outlet/crossing line overlay. Multiple lines accumulate."""
         if not points or len(points) < 2:
             return
         self.outlet_line_points = [QgsPointXY(p) for p in points]
@@ -1128,10 +1144,14 @@ class DDMHydroLogicDock(QDockWidget):
         band.setToGeometry(geom, None)
         band.show()
         self.outlet_line_band = band
+        self.outlet_line_bands.append(band)
 
     def _clear_outlet_line_overlay(self):
-        """Removes and sanitises all red outlet/crossing canvas state."""
-        for band in (getattr(self, "outlet_line_band", None), getattr(getattr(self, "draw_tool", None), "rubber_band", None)):
+        """Removes and sanitises all red outlet/crossing canvas state (every drawn line)."""
+        bands = list(getattr(self, "outlet_line_bands", []))
+        bands.append(getattr(self, "outlet_line_band", None))
+        bands.append(getattr(getattr(self, "draw_tool", None), "rubber_band", None))
+        for band in bands:
             if band is not None:
                 try:
                     band.reset(enum_member(QgsWkbTypes, "GeometryType", "LineGeometry"))
@@ -1148,8 +1168,10 @@ class DDMHydroLogicDock(QDockWidget):
         except Exception:
             pass
         self.outlet_line_band = None
+        self.outlet_line_bands = []
         self.outlet_line_points = []
         self.outlet_line_layer_geom = None
+        self.outlet_line_geoms = []
         try:
             self.canvas.refresh()
         except Exception:
@@ -1338,31 +1360,48 @@ class DDMHydroLogicDock(QDockWidget):
             cells = [int(c) for c in cells]
         return cells
 
+    def _outlet_cells_union(self):
+        """Union of displayed flow cells crossed by every drawn outlet line."""
+        merged = []
+        seen = set()
+        for geom in getattr(self, "outlet_line_geoms", []):
+            if geom is None or geom.isNull() or geom.isEmpty():
+                continue
+            for cell in self._flow_cells_crossed_by_outlet_geometry(geom):
+                cid = int(cell)
+                if cid not in seen:
+                    seen.add(cid)
+                    merged.append(cid)
+        return merged
+
     def _refresh_outlet_cells_from_red_line(self):
-        """Recomputes outlet cells from the stored red outlet line if needed."""
+        """Recomputes outlet cells from the stored red outlet line(s) if needed."""
         if self.engine is None:
             return []
         if self.outlet_cells:
             return list(self.outlet_cells)
-        geom = getattr(self, "outlet_line_layer_geom", None)
-        if geom is None or geom.isNull() or geom.isEmpty():
-            try:
-                if self.outlet_line_points and len(self.outlet_line_points) >= 2:
-                    flow_crs = self.engine.flow_layer.crs() if self._engine_layer_is_available("flow_layer") else self.engine.dem_layer.crs()
-                    layer_points = self.engine.transform_polyline(
-                        self.outlet_line_points,
-                        self.canvas.mapSettings().destinationCrs(),
-                        flow_crs,
-                    )
-                    geom = QgsGeometry.fromPolylineXY([QgsPointXY(p) for p in layer_points])
-                    self.outlet_line_layer_geom = QgsGeometry(geom)
-            except Exception:
-                geom = None
-        if geom is None or geom.isNull() or geom.isEmpty():
-            return []
-        cells = self._flow_cells_crossed_by_outlet_geometry(geom)
+        if not getattr(self, "outlet_line_geoms", []):
+            # Rebuild a single geometry from the last drawn canvas points if the
+            # layer geometry was lost (e.g. after a CRS change) but points remain.
+            geom = getattr(self, "outlet_line_layer_geom", None)
+            if geom is None or geom.isNull() or geom.isEmpty():
+                try:
+                    if self.outlet_line_points and len(self.outlet_line_points) >= 2:
+                        flow_crs = self.engine.flow_layer.crs() if self._engine_layer_is_available("flow_layer") else self.engine.dem_layer.crs()
+                        layer_points = self.engine.transform_polyline(
+                            self.outlet_line_points,
+                            self.canvas.mapSettings().destinationCrs(),
+                            flow_crs,
+                        )
+                        geom = QgsGeometry.fromPolylineXY([QgsPointXY(p) for p in layer_points])
+                except Exception:
+                    geom = None
+            if geom is not None and not geom.isNull() and not geom.isEmpty():
+                self.outlet_line_geoms = [QgsGeometry(geom)]
+                self.outlet_line_layer_geom = QgsGeometry(geom)
+        cells = self._outlet_cells_union()
         if cells:
-            self.outlet_cells = list(cells)
+            self.outlet_cells = cells
         return list(self.outlet_cells or [])
 
     def _current_rorb_outlet_cell(self):
@@ -1473,6 +1512,9 @@ class DDMHydroLogicDock(QDockWidget):
         """Exports the current plugin outputs to a RORBwin/RORB GE .catg file."""
         if not self._require_engine_and_layer():
             return
+        if len(getattr(self, "outlet_line_geoms", [])) > 1:
+            QMessageBox.warning(self, "DDM HydroLogic", "WARNING: multiple outlet lines have been drawn. Only 1 outlet is admissible in RORB. Clear and re-draw one outlet line.")
+            return
         if not self._engine_layer_is_available("subcatchment_layer"):
             QMessageBox.warning(self, "DDM HydroLogic", "Press Process subcatchments before exporting a RORB GE .catg file.")
             return
@@ -1576,6 +1618,9 @@ class DDMHydroLogicDock(QDockWidget):
         """Exports the current plugin outputs to a first-pass WBNM 2025 .wbn runfile."""
         if not self._require_engine_and_layer():
             return
+        if len(getattr(self, "outlet_line_geoms", [])) > 1:
+            QMessageBox.warning(self, "DDM HydroLogic", "WARNING: multiple outlet lines have been drawn. Only 1 outlet is admissible in WBNM. Clear and re-draw one outlet line.")
+            return
         if not self._engine_layer_is_available("subcatchment_layer"):
             QMessageBox.warning(self, "DDM HydroLogic", "Press Process subcatchments before exporting a WBNM 2025 .wbn file.")
             return
@@ -1636,6 +1681,9 @@ class DDMHydroLogicDock(QDockWidget):
     def export_xprafts(self):
         """Exports the current plugin outputs to a first-pass XP-RAFTS .xpx file."""
         if not self._require_engine_and_layer():
+            return
+        if len(getattr(self, "outlet_line_geoms", [])) > 1:
+            QMessageBox.warning(self, "DDM HydroLogic", "WARNING: multiple outlet lines have been drawn. Only 1 outlet is admissible in XP-RAFTS. Clear and re-draw one outlet line.")
             return
         if not self._engine_layer_is_available("subcatchment_layer"):
             QMessageBox.warning(self, "DDM HydroLogic", "Press Process subcatchments before exporting an XP-RAFTS .xpx file.")
@@ -1767,6 +1815,81 @@ class DDMHydroLogicDock(QDockWidget):
         except Exception as exc:  # pragma: no cover
             self._show_dependency_or_runtime_error("TUFLOW shapefile export", exc)
             self.status_label.setText("TUFLOW shapefile export failed.")
+        finally:
+            self.active_operation = None
+            self._set_busy(False)
+
+    def export_urbs(self):
+        """Exports the current plugin outputs to URBS .vec and .csv files."""
+        if not self._require_engine_and_layer():
+            return
+        if not self._engine_layer_is_available("subcatchment_layer"):
+            QMessageBox.warning(self, "DDM HydroLogic", "Press Process subcatchments before exporting URBS files.")
+            return
+        if not self.current_assignments:
+            QMessageBox.warning(self, "DDM HydroLogic", "Current subcatchment assignments are not available. Press Process subcatchments before exporting URBS files.")
+            return
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Choose a folder for the URBS files",
+            os.path.expanduser("~"),
+        )
+        if not folder:
+            return
+
+        existing = [
+            name for name in ("URBS_RoutingFile.vec", "URBS_SubcatFile.csv")
+            if os.path.exists(os.path.join(folder, name))
+        ]
+        if existing:
+            response = QMessageBox.question(
+                self,
+                "URBS files already exist",
+                f"This folder already contains {', '.join(existing)}.\n\nOverwrite?",
+                enum_member(QMessageBox, "StandardButton", "Yes") | enum_member(QMessageBox, "StandardButton", "No"),
+                enum_member(QMessageBox, "StandardButton", "No"),
+            )
+            if response != enum_member(QMessageBox, "StandardButton", "Yes"):
+                return
+
+        try:
+            self.abort_requested = False
+            self.active_operation = "urbs_export"
+            self._set_busy(True)
+            self._progress(10, "Preparing URBS export")
+            output_dir, written, subarea_count, outlet_count, total_area_km2 = write_urbs_from_engine(
+                self.engine,
+                self.current_assignments,
+                folder,
+            )
+            self.progress.setValue(100)
+            file_names = "\n".join(os.path.basename(path) for path in written)
+            self.status_label.setText(
+                f"Exported URBS files to {output_dir}. "
+                f"Subareas: {subarea_count:,}; outlets: {outlet_count:,}; total area: {total_area_km2:,.3f} km². "
+                "Land-use fractions, losses and model parameters are defaults to review in URBS."
+            )
+            QMessageBox.information(
+                self,
+                "DDM HydroLogic",
+                "URBS export complete.\n\n"
+                f"{output_dir}\n\n"
+                f"{file_names}\n\n"
+                f"Subareas: {subarea_count:,}\n"
+                f"Outlets: {outlet_count:,}\n"
+                f"Total area: {total_area_km2:,.3f} km²\n\n"
+                "The .vec routing file references the .csv catchment data file. Reach lengths and slopes are "
+                "derived from the DEM; land-use fractions, losses and model parameters are defaults to complete in URBS."
+            )
+        except HydrologyCancelled:
+            self.status_label.setText("URBS export aborted.")
+        except UrbsExportError as exc:
+            QMessageBox.warning(self, "DDM HydroLogic", str(exc))
+            self.status_label.setText("URBS export was not completed.")
+        except Exception as exc:  # pragma: no cover
+            self._show_dependency_or_runtime_error("URBS export", exc)
+            self.status_label.setText("URBS export failed.")
         finally:
             self.active_operation = None
             self._set_busy(False)
@@ -2022,7 +2145,7 @@ class DDMHydroLogicDock(QDockWidget):
             pass
         gc.collect()
         self.progress.setValue(100)
-        self.status_label.setText("Outlet line cleared. Draw a new outlet line before processing subcatchments, or process the whole DEM when prompted.")
+        self.status_label.setText("Outlet line(s) cleared. Draw new outlet line(s) before processing subcatchments, or process the whole DEM when prompted.")
 
     def clear_subcatchments(self):
         """Clears only the generated subcatchment layer/assignments."""

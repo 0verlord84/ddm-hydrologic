@@ -2,9 +2,10 @@
 name=DDM HydroLogic
 qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
-description=Delineate and create model-ready catchments interactively. Trace D8 flow paths, selects the streams that matter, drop an outlet line, and export straight to GeoPackage, RORB, WBNM, XP-RAFTS or TUFLOW.
-version=2.0
-changelog=2.0 - Back compatibility and support for earlier QGIS versions (Long Term Release 3.22) and a much faster interactive overlay.
+description=Delineate and create model-ready catchments interactively. Trace D8 flow paths, selects the streams that matter, drop an outlet line, and export straight to GeoPackage, RORB, WBNM, XP-RAFTS, TUFLOW or URBS.
+version=2.1
+changelog=2.1 - Export to URBS (.vec/.csv), support for multiple outlet lines, and a warning when a multi-outlet model is exported to the single-outlet formats (RORB, WBNM, XP-RAFTS).
+    2.0 - Back compatibility and support for earlier QGIS versions (Long Term Release 3.22) and a much faster interactive overlay.
     1.0 - First release
 author=Davide Di Mauro
 initials=DDM
@@ -20,7 +21,8 @@ about=Setting up a hydrologic model usually means a few hours of GIS prep work
     RORB .catg GE-ready catchment file,
     WBNM .wbn runfile,
     XP-RAFTS .xpx exchange file,
-    or some of the most popular TUFLOW xxx_R.shp.
+    some of the most popular TUFLOW xxx_R.shp,
+    or URBS .vec routing and .csv catchment files.
 
     It is important to note that all hydrological/hydraulic choices and parameters, such as 
     rainfall, losses, Manning's coefficients, subcatchment types, slope, etc..
@@ -33,7 +35,7 @@ about=Setting up a hydrologic model usually means a few hours of GIS prep work
     Licensed under the GNU General Public License version 2 or later
     
 category=Raster, Vector
-tags=catchment,watershed,hydrology,DEM,D8,Strahler,subcatchment,RORB,WBNM,XP-RAFTS,TUFLOW
+tags=catchment,watershed,hydrology,DEM,D8,Strahler,subcatchment,RORB,WBNM,XP-RAFTS,TUFLOW,URBS
 homepage=https://github.com/0verlord84/ddm-hydrologic
 repository=https://github.com/0verlord84/ddm-hydrologic
 tracker=https://github.com/0verlord84/ddm-hydrologic/issues
