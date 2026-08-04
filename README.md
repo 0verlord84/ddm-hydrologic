@@ -6,9 +6,10 @@
 1. Retro compatibility with QGIS 3.22 LTR (tested on v3.22.16)
 2. Faster sub catchment processing and selection
 
-**v2.1 now features:**
+**v2.0.2 now features:**
 1. Export to URBS (.vec routing file and .csv catchment data file)
 2. Multiple outlet lines can be drawn for multi-outlet models
+3. Companion shapefiles written with every model export (subareas, centroids, entry points, nodal links and streams)
 
 **INTRO**
 
@@ -22,7 +23,7 @@ Setting up a hydrologic model usually means a few hours of GIS prep work before 
 
 It is important to note that all hydrological/hydraulic choices, such as rainfall, losses, Manning's coefficients, subcatchment types, impervious fractions, etc.. have been deliberately left blank or default values.
 
-Current version: **2.1** · QGIS 3.22 LTR and 4.x
+Current version: **2.0.2** · QGIS 3.22 LTR and 4.x
 
 ## Workflow
 
@@ -38,7 +39,7 @@ Current version: **2.1** · QGIS 3.22 LTR and 4.x
 ## Outputs
 
 - **Export flow paths and subcatchments to GeoPackage** writes same-order Strahler reaches and subcatchment polygons. The default filename is `DDM_HydroLogic_outputs_version_.gpkg`.
-- **Export to RORB (.catg)** writes a first-pass RORBwin/RORB GE `.catg` file using a self-contained connected node-link writer. The drawn outlet line is used to create the explicit RORB outlet node where available, and the export validates that every node drains to that outlet before writing (tested in RORB v6.52). DDM HydroLogic automatically loads temporary **RORB nodes** and **RORB links**.
+- **Export to RORB (.catg)** writes a first-pass RORBwin/RORB GE `.catg` file using a self-contained connected node-link writer. Sub-area nodes are placed on the main stream adjacent to the sub-area centroid, where the sub-area's rainfall-excess enters the channel network, and reach lengths are measured along the stream between adjacent nodes. The drawn outlet line is used to create the explicit RORB outlet node where available, and the export validates that every node drains to that outlet before writing (tested in RORB v6.52). DDM HydroLogic automatically loads temporary **RORB nodes** and **RORB links**.
 - **Export to WBNM 2025 (.wbn)** writes a first-pass WBNM runfile (see notes below).
 - **Export to XP-RAFTS (.xpx)** writes a first-pass XP-RAFTS exchange file (see notes below).
 - **Export TUFLOW files (.shp)** writes TUFLOW regions shp into a chosen folder. The final catchment will be included in the scaffoldings of the following: 2d_code, 2d_loc, 2d_rf, 2d_po, 2d_mat, 2d_qnl and 2d_soil.
@@ -87,6 +88,25 @@ and channel slopes (Sc) come from each subarea's main channel; the catchment slo
 Land-use fractions (U, UF, I) are read from FracUrban/FracForest/FracImp fields if
 the subcatchment layer has them, otherwise written as zero. Losses and model
 parameters are left as defaults to complete in URBS.
+
+## Companion GIS files
+
+Every model export also writes five shapefiles into a folder of your choosing, in
+the CRS of the DEM and named after the model file:
+
+| File | Holds |
+| --- | --- |
+| `<Model>_Subareas.shp` | the subcatchment polygons |
+| `<Model>_Centroids.shp` | the subarea centroids |
+| `<Model>_EntryPoints.shp` | the point on each subarea's main stream where its rainfall-excess enters the channel network |
+| `<Model>_NodalLinks.shp` | the routing topology, `From_ID` to `To_ID` |
+| `<Model>_Streams.shp` | the Strahler-ordered stream network |
+
+Each layer carries `Model_ID`, the subarea label exactly as it appears in the model
+file (`1`, `2`, `3` for URBS, `S001` for WBNM and XP-RAFTS, the node number for
+RORB), so a node in the `.catg`, `.vec`, `.csv`, `.wbn` or `.xpx` can be found on
+the map and the other way round. The files are loaded into their own QGIS group
+after each export.
 
 ## Scripting maintenance notes
 

@@ -467,3 +467,12 @@ def write_wbnm_2025_from_engine(
         handle.write("\n".join(lines).rstrip() + "\n")
 
     return output_path, len(ordered), round(total_area_ha, 3), len(flowpath_outlets)
+
+
+def model_id_map(engine, assignments):
+    """Subarea names as written to the runfile, keyed by outlet cell."""
+    features = _subcatchment_features_by_outlet(engine)
+    selected = {int(o) for o, cells in assignments.items() if cells and int(o) in features}
+    ds_map = _downstream_map(engine, assignments, selected)
+    ordered = _topological_order(ds_map, engine)
+    return {int(o): f"S{i:03d}" for i, o in enumerate(ordered, start=1)}, ds_map

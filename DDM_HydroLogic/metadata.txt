@@ -3,8 +3,8 @@ name=DDM HydroLogic
 qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
 description=Delineate and create model-ready catchments interactively. Trace D8 flow paths, selects the streams that matter, drop an outlet line, and export straight to GeoPackage, RORB, WBNM, XP-RAFTS, TUFLOW or URBS.
-version=2.1
-changelog=2.1 - Export to URBS (.vec/.csv), support for multiple outlet lines, and a warning when a multi-outlet model is exported to the single-outlet formats (RORB, WBNM, XP-RAFTS).
+version=2.0.2
+changelog=2.0.2 - Export to URBS (.vec/.csv). Every model export now also writes companion shapefiles (subareas, centroids, sub-area entry points, nodal links and streams) carrying the same sub-area IDs as the model file. Multiple outlet lines can be drawn, with a warning when a multi-outlet model is sent to the single-outlet formats (RORB, WBNM, XP-RAFTS). RORB sub-area nodes are placed on the main stream adjacent to the sub-area centroid.
     2.0 - Back compatibility and support for earlier QGIS versions (Long Term Release 3.22) and a much faster interactive overlay.
     1.0 - First release
 author=Davide Di Mauro

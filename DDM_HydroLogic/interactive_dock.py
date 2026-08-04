@@ -62,6 +62,8 @@ from .tuflow_exporter import TUFLOW_LAYERS, TuflowExportError, write_tuflow_from
 from .wbnm_2025_exporter import Wbnm2025ExportError, write_wbnm_2025_from_engine
 from .xprafts_exporter import XpRaftsExportError, write_xprafts_from_engine
 from .urbs_exporter import UrbsExportError, write_urbs_from_engine
+from . import rorb_catg_exporter, urbs_exporter, wbnm_2025_exporter, xprafts_exporter
+from .gis_outputs import write_model_gis_outputs
 
 
 def _writer_no_error_code():
@@ -1585,6 +1587,12 @@ class DDMHydroLogicDock(QDockWidget):
             )
             self._progress(78, "Loading generated RORB temporary layers into QGIS")
             loaded_rorb_layers = self._load_rorb_layers_group_from_catg(output_path)
+            self._export_gis_companions(
+                "RORB",
+                os.path.dirname(output_path),
+                os.path.splitext(os.path.basename(output_path))[0],
+                lambda: rorb_catg_exporter.model_id_map(self.engine, self.current_assignments, outlet_cell),
+            )
             self.progress.setValue(100)
             self.status_label.setText(
                 f"Exported RORB .catg file: {output_path}. "
@@ -1650,6 +1658,12 @@ class DDMHydroLogicDock(QDockWidget):
                 path,
                 model_name="DDM_HydroLogic",
             )
+            self._export_gis_companions(
+                "WBNM",
+                os.path.dirname(output_path),
+                os.path.splitext(os.path.basename(output_path))[0],
+                lambda: wbnm_2025_exporter.model_id_map(self.engine, self.current_assignments),
+            )
             self.progress.setValue(100)
             self.status_label.setText(
                 f"Exported WBNM 2025 .wbn runfile: {output_path}. "
@@ -1713,6 +1727,12 @@ class DDMHydroLogicDock(QDockWidget):
                 self.current_assignments,
                 path,
                 model_name="DDM_HydroLogic",
+            )
+            self._export_gis_companions(
+                "XP-RAFTS",
+                os.path.dirname(output_path),
+                os.path.splitext(os.path.basename(output_path))[0],
+                lambda: xprafts_exporter.model_id_map(self.engine, self.current_assignments),
             )
             self.progress.setValue(100)
             self.status_label.setText(
@@ -1863,6 +1883,13 @@ class DDMHydroLogicDock(QDockWidget):
                 self.current_assignments,
                 folder,
             )
+            self._export_gis_companions(
+                "URBS",
+                output_dir,
+                "URBS",
+                lambda: urbs_exporter.model_id_map(self.engine, self.current_assignments),
+                folder=output_dir,
+            )
             self.progress.setValue(100)
             file_names = "\n".join(os.path.basename(path) for path in written)
             self.status_label.setText(
@@ -1937,6 +1964,71 @@ class DDMHydroLogicDock(QDockWidget):
         except Exception:
             pass
         self.canvas.refresh()
+
+    def _export_gis_companions(self, model_name, default_dir, prefix, id_map_call, folder=None):
+        """Writes and loads the companion shapefiles that go with a model export.
+
+        ``id_map_call`` returns the sub-area labels used by that model file, so the
+        shapefiles carry the same identifiers as the exported model.
+        """
+        try:
+            model_ids, downstream_map = id_map_call()
+        except Exception as exc:
+            QMessageBox.warning(self, "DDM HydroLogic", f"Could not match the {model_name} sub-area IDs, so no GIS files were written.\n\n{exc}")
+            return []
+
+        if not folder:
+            folder = QFileDialog.getExistingDirectory(
+                self,
+                f"Choose a folder for the {model_name} GIS files",
+                default_dir or os.path.expanduser("~"),
+            )
+        if not folder:
+            return []
+
+        try:
+            _output_dir, written = write_model_gis_outputs(
+                self.engine,
+                self.current_assignments,
+                folder,
+                prefix,
+                model_ids,
+                downstream_map,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "DDM HydroLogic", f"The {model_name} model file was written, but the GIS files were not.\n\n{exc}")
+            return []
+
+        self._load_gis_companion_group(f"{model_name} GIS", written)
+        return written
+
+    def _load_gis_companion_group(self, group_name, paths):
+        """Loads exported companion shapefiles into their own group in QGIS."""
+        loaded = []
+        try:
+            project = QgsProject.instance()
+            root = project.layerTreeRoot()
+            try:
+                old_group = root.findGroup(group_name)
+                if old_group is not None:
+                    root.removeChildNode(old_group)
+            except Exception:
+                pass
+            group = root.insertGroup(0, group_name)
+            for path in paths:
+                name = os.path.splitext(os.path.basename(path))[0]
+                layer = QgsVectorLayer(path, name, "ogr")
+                if layer is None or not layer.isValid():
+                    continue
+                project.addMapLayer(layer, False)
+                group.addLayer(layer)
+                loaded.append(name)
+            self.canvas.refresh()
+        except Exception:
+            # The shapefiles are on disk either way; failing to display them
+            # should not turn a completed export into an error.
+            pass
+        return loaded
 
     def _load_rorb_layers_group_from_catg(self, path):
         """Loads generated RORB temporary layers under a top-of-panel RORB group."""

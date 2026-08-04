@@ -23,6 +23,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from qgis.core import QgsPointXY
 
+from .catchment_geometry import downstream_outlet_map, downstream_path, subarea_metrics
+
 
 class RorbCatgExportError(Exception):
     """Raised when the current plugin outputs cannot be converted to .catg."""
@@ -465,16 +467,25 @@ def write_rorb_catg_from_engine(
             out_x, out_y = _point_tuple(engine.cell_center(int(downstream_most)))
             out_x, out_y = _tiny_offset_point(engine, (out_x, out_y))
 
+    # RORB places a sub-area node on the sub-area's main stream adjacent to its
+    # centroid; that is where the sub-area's rainfall-excess enters the channel
+    # network. Reaches then span the stream between adjacent nodes.
+    metrics = subarea_metrics(engine, sub_features, assignments, ordered_outlets)
+    entry_cells: Dict[int, int] = {}
+    for outlet_id in ordered_outlets:
+        entry = int(metrics[int(outlet_id)].get("entry_cell", -1))
+        entry_cells[int(outlet_id)] = entry if entry >= 0 else int(outlet_id)
+
     outlet_id_to_node: Dict[int, int] = {}
     nodes: Dict[int, dict] = {}
     for idx, outlet_id in enumerate(ordered_outlets, start=1):
-        pt = engine.cell_center(int(outlet_id))
+        pt = engine.cell_center(entry_cells[int(outlet_id)])
         if _same_xy((float(pt.x()), float(pt.y())), (float(out_x), float(out_y)), tol=1e-6):
             out_x, out_y = _tiny_offset_point(engine, (float(out_x), float(out_y)))
             break
 
     for idx, outlet_id in enumerate(ordered_outlets, start=1):
-        pt = engine.cell_center(int(outlet_id))
+        pt = engine.cell_center(entry_cells[int(outlet_id)])
         feat = sub_features[int(outlet_id)]
         area_km2 = max(0.0, float(_feature_area_m2(feat)) / 1_000_000.0)
         fi = _feature_impervious_fraction(feat, field_name=impervious_field, default=float(fraction_impervious))
@@ -516,29 +527,51 @@ def write_rorb_catg_from_engine(
         if ds_outlet is not None and int(ds_outlet) in outlet_id_to_node:
             ds_node = outlet_id_to_node[int(ds_outlet)]
             ds_pt = (float(nodes[int(ds_node)]["x"]), float(nodes[int(ds_node)]["y"]))
+            target_cell = entry_cells.get(int(ds_outlet))
+            fallback_cell = int(ds_outlet)
         else:
             ds_node = int(outlet_node_id)
             ds_pt = (float(out_x), float(out_y))
+            target_cell = int(model_outlet_cell) if model_outlet_cell is not None else None
+            fallback_cell = None
         nodes[int(us_node)]["downstream"] = int(ds_node)
         downstream[int(us_node)] = int(ds_node)
 
-        if not points:
-            points = [_point_tuple(engine.cell_center(int(outlet_id)))]
-        points = list(points)
-        if not _same_xy(points[-1], ds_pt):
-            points.append(ds_pt)
-        points = _dedupe_consecutive_points(points)
-        if len(points) < 2:
-            points.append(_tiny_offset_point(engine, points[0]))
+        # The reach is the stream between this node and the next one downstream,
+        # so it starts at this sub-area's entry point rather than its outlet.
+        start_cell = int(entry_cells[int(outlet_id)])
+        cells: List[int] = []
+        if target_cell is not None:
+            cells = downstream_path(engine, start_cell, int(target_cell))
+        if not cells and fallback_cell is not None:
+            # The downstream node sits on a different branch; measure to that
+            # sub-area's outlet instead of guessing an upstream distance.
+            cells = downstream_path(engine, start_cell, int(fallback_cell))
+        if cells:
+            reach_points = [_point_tuple(engine.cell_center(int(c))) for c in cells]
+        else:
+            head = downstream_path(engine, start_cell, int(outlet_id))
+            reach_points = [_point_tuple(engine.cell_center(int(c))) for c in head] if head else []
+            tail = list(points or [])
+            if reach_points and tail and _same_xy(reach_points[-1], tail[0]):
+                tail = tail[1:]
+            reach_points = reach_points + tail
+        if not reach_points:
+            reach_points = [_point_tuple(engine.cell_center(start_cell))]
+        if not _same_xy(reach_points[-1], ds_pt):
+            reach_points.append(ds_pt)
+        reach_points = _dedupe_consecutive_points(reach_points)
+        if len(reach_points) < 2:
+            reach_points.append(_tiny_offset_point(engine, reach_points[0]))
         reaches.append({
             "id": int(rid),
             "name": f"R{rid:03d}",
             "us_node": int(us_node),
             "ds_node": int(ds_node),
             "reach_type": reach_type_value,
-            "length_m": max(0.0, _distance(points)),
+            "length_m": max(0.0, _distance(reach_points)),
             "slope": 0.0,
-            "points": points,
+            "points": reach_points,
         })
 
     if not reaches:
@@ -558,3 +591,18 @@ def write_rorb_catg_from_engine(
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     _write_manual_catg(output_path, str(rorb_version or "6.52"), nodes, reaches, int(outlet_node_id), basin_order, vector_lines)
     return output_path, len(ordered_outlets), len(reaches)
+
+def model_id_map(engine, assignments, model_outlet_cell=None):
+    """Node numbers as written to the .catg, keyed by outlet cell."""
+    sub_features = _subcatchment_features_by_outlet(engine)
+    selected = {int(k) for k, cells in assignments.items() if cells and int(k) in sub_features}
+    if model_outlet_cell is not None:
+        try:
+            upstream = set(int(c) for c in engine.collect_upstream(int(model_outlet_cell)))
+            upstream.add(int(model_outlet_cell))
+            selected = {o for o in selected if o in upstream}
+        except Exception:
+            pass
+    ordered = sorted(selected, key=lambda cid: (int(engine.accumulation[int(cid)]), int(cid)))
+    return ({int(o): str(i) for i, o in enumerate(ordered, start=1)},
+            downstream_outlet_map(engine, assignments, selected))
