@@ -7,7 +7,7 @@
 # Foundation, either version 2 of the License, or (at your option) any later
 # version. It is distributed WITHOUT ANY WARRANTY. See the GNU General Public
 # License (the LICENSE file) for more details.
-"""Write the GIS companion shapefiles that go with a model export.
+"""Write the GIS companion shapefiles that come out from a model export function.
 
 Every model export can drop five shapefiles beside it so the model can be read
 back on the map: the sub-area polygons, their centroids, the sub-area entry
@@ -86,7 +86,7 @@ def _make_field(name: str, kind: str, width: int, precision: int) -> "QgsField":
 
 
 def _numeric_id(label, fallback: int) -> int:
-    """Numeric id taken from a model label, so ID lines up with Model_ID.
+    """Numeric id taken from a model label, so a feature ID lines up with Model_ID.
 
     URBS numbers its sub-areas directly, WBNM and XP-RAFTS use names like S001;
     both reduce to the same integer. Anything without digits keeps its position.
