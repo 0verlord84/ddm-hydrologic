@@ -7,7 +7,7 @@
 # Foundation, either version 2 of the License, or (at your option) any later
 # version. It is distributed WITHOUT ANY WARRANTY. See the GNU General Public
 # License (the LICENSE file) for more details.
-"""Write URBS input files (a .vec routing vector file and a .csv catchment data
+"""Writes URBS input files (a .vec routing vector file and a .csv catchment data
 file) from the processed subcatchments.
 
 URBS reads a catchment as two files: a routing vector file describing the tree of
