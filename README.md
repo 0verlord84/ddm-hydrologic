@@ -2,8 +2,8 @@
 
 **From DEM to model-ready catchments in QGIS.**
 
-**v2.1 now features:** (Special thanks to Callan Shonrock)
-1. Export to URBS (.vec routing file and .csv catchment data file)
+**v2.1 now features:**
+1. Export to URBS (.vec routing file and .csv catchment data file) - Special thanks to Callan Shonrock!
 2. Multiple outlet lines can be drawn for multi-outlet models
 3. Every model export has got companion shapefiles: subareas, centroids, entry points, nodal links and streams
 
