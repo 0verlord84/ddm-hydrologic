@@ -46,6 +46,8 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
+from .compat import enum_member, log_ignored
+
 # QVariant type plus the memory-provider type name for each field kind.
 _FIELD_TYPES = {
     "string": (QVariant.String, "string"),
@@ -88,13 +90,19 @@ class TuflowExportError(Exception):
 
 
 def _writer_no_error_code():
-    """Returns the vector-writer success code for QGIS 3 or QGIS 4."""
-    if hasattr(QgsVectorFileWriter, "NoError"):
-        return QgsVectorFileWriter.NoError
-    writer_error = getattr(QgsVectorFileWriter, "WriterError", None)
-    if writer_error is not None and hasattr(writer_error, "NoError"):
-        return writer_error.NoError
-    return 0
+    """Returns the vector-writer success code, scoped Qt6 enum first."""
+    try:
+        return enum_member(QgsVectorFileWriter, "WriterError", "NoError")
+    except AttributeError:
+        return 0
+
+
+def _writer_action(member: str):
+    """Action-on-existing-file member, scoped Qt6 enum first."""
+    try:
+        return enum_member(QgsVectorFileWriter, "ActionOnExistingFile", member)
+    except AttributeError:
+        return None
 
 
 def _make_field(name: str, kind: str, width: int, precision: int) -> "QgsField":
@@ -115,6 +123,7 @@ def _subcatchment_features_by_outlet(engine) -> Dict[int, object]:
         try:
             features[int(feat["outlet_id"])] = feat
         except Exception:
+            log_ignored("tuflow_exporter._subcatchment_features_by_outlet")
             continue
     if not features:
         raise TuflowExportError(
@@ -131,13 +140,13 @@ def _feature_area_m2(feat) -> float:
             if math.isfinite(area) and area > 0:
                 return area
     except Exception:
-        pass
+        log_ignored("tuflow_exporter._feature_area_m2")
     try:
         area = float(feat["area_m2"])
         if math.isfinite(area) and area > 0:
             return area
     except Exception:
-        pass
+        log_ignored("tuflow_exporter._feature_area_m2")
     return 0.0
 
 
@@ -147,7 +156,7 @@ def _dem_crs(engine):
         if crs is not None and crs.isValid():
             return crs
     except Exception:
-        pass
+        log_ignored("tuflow_exporter._dem_crs")
     return None
 
 
@@ -162,6 +171,7 @@ def _dissolved_boundary(features: Iterable[object]) -> "QgsGeometry":
             if geom is not None and not geom.isNull() and not geom.isEmpty():
                 geoms.append(QgsGeometry(geom))
         except Exception:
+            log_ignored("tuflow_exporter._dissolved_boundary")
             continue
     if not geoms:
         raise TuflowExportError(
@@ -195,11 +205,11 @@ def _dissolved_boundary(features: Iterable[object]) -> "QgsGeometry":
         if repaired is not None and not repaired.isNull() and not repaired.isEmpty():
             union = repaired
     except Exception:
-        pass
+        log_ignored("tuflow_exporter._dissolved_boundary")
     try:
         union.convertToMultiType()
     except Exception:
-        pass
+        log_ignored("tuflow_exporter._dissolved_boundary")
     return union
 
 
@@ -216,7 +226,7 @@ def _transform_to_dem_crs(geometry: "QgsGeometry", source_layer, dem_crs) -> "Qg
     except Exception:
         # Subcatchments are derived from the DEM, so the CRSs match in
         # practice; a failed transform should not abort the export.
-        pass
+        log_ignored("tuflow_exporter._transform_to_dem_crs")
     return geometry
 
 
@@ -260,12 +270,9 @@ def _write_region_shapefile(path: str, fields_spec, values, boundaries, crs) -> 
     options = QgsVectorFileWriter.SaveVectorOptions()
     options.driverName = "ESRI Shapefile"
     options.fileEncoding = "UTF-8"
-    if hasattr(QgsVectorFileWriter, "CreateOrOverwriteFile"):
-        options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
-    else:
-        action_enum = getattr(QgsVectorFileWriter, "ActionOnExistingFile", None)
-        if action_enum is not None:
-            options.actionOnExistingFile = action_enum.CreateOrOverwriteFile
+    overwrite = _writer_action("CreateOrOverwriteFile")
+    if overwrite is not None:
+        options.actionOnExistingFile = overwrite
 
     if hasattr(QgsVectorFileWriter, "writeAsVectorFormatV3"):
         result = QgsVectorFileWriter.writeAsVectorFormatV3(

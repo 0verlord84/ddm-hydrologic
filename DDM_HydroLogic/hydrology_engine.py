@@ -41,7 +41,7 @@ from qgis.core import (
     QgsFillSymbol,
 )
 
-from .compat import enum_member
+from .compat import enum_member, log_ignored
 
 
 class HydrologyBuildError(Exception):
@@ -118,7 +118,7 @@ class D8HydrologyEngine:
             raise
         except Exception:
             # Cancelation checks must never become the reason a hydrology build fails.
-            pass
+            log_ignored("hydrology_engine._check_cancelled")
 
     def _read_dem(self):
         self._emit(2, "Reading DEM")
@@ -203,7 +203,7 @@ class D8HydrologyEngine:
                 if not fixed.isNull() and not fixed.isEmpty():
                     mask_geom = fixed
         except Exception:
-            pass
+            log_ignored("hydrology_engine._combined_mask_geometry_in_dem_crs")
 
         try:
             source_crs = layer.crs()
@@ -738,6 +738,7 @@ class D8HydrologyEngine:
                     if order >= 1:
                         orders.add(order)
                 except Exception:
+                    log_ignored("hydrology_engine._style_flow_layer")
                     continue
         except Exception:
             # Fallback for partially initialised layers.
@@ -788,6 +789,7 @@ class D8HydrologyEngine:
                 displayed_cells.add(cell_id)
                 stream_order[cell_id] = max(1, int(feat["strahler"]))
             except Exception:
+                log_ignored("hydrology_engine.create_reach_flow_layer")
                 continue
         if not displayed_cells:
             raise HydrologyBuildError("The temporary flow-path layer contains no displayed flow paths to export.")

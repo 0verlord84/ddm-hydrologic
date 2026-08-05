@@ -31,6 +31,8 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
+from .compat import log_ignored
+
 
 class RorbCatgImportError(Exception):
     """Raised when a .catg file cannot be parsed into temporary GIS layers."""
@@ -102,6 +104,7 @@ def _parse_nodes(lines: List[str]) -> Dict[str, dict]:
             excess = int(float(parts[11])) if len(parts) > 11 and _looks_numeric(parts[11]) else 0
             comment = int(float(parts[12])) if len(parts) > 12 and _looks_numeric(parts[12]) else 0
         except Exception:
+            log_ignored("rorb_catg_importer._parse_nodes")
             continue
         nodes[node_id] = {
             "node_id": node_id,

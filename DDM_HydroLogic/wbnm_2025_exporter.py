@@ -32,6 +32,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from qgis.core import QgsGeometry, QgsProject
 
+from .compat import log_ignored
+
 # Two blank lines separate every block; field width is 12 characters.
 FIELD = 12
 BLOCK_GAP = ("", "")
@@ -91,6 +93,7 @@ def _subcatchment_features_by_outlet(engine) -> Dict[int, object]:
         try:
             features[int(feat["outlet_id"])] = feat
         except Exception:
+            log_ignored("wbnm_2025_exporter._subcatchment_features_by_outlet")
             continue
     if not features:
         raise Wbnm2025ExportError(
@@ -108,13 +111,13 @@ def _feature_area_m2(feat) -> float:
             if math.isfinite(area) and area > 0:
                 return area
     except Exception:
-        pass
+        log_ignored("wbnm_2025_exporter._feature_area_m2")
     try:
         area = float(feat["area_m2"])
         if math.isfinite(area) and area > 0:
             return area
     except Exception:
-        pass
+        log_ignored("wbnm_2025_exporter._feature_area_m2")
     return 0.0
 
 
@@ -130,7 +133,7 @@ def _feature_centroid_xy(feat) -> Tuple[float, float]:
             p = point.asPoint()
             return (float(p.x()), float(p.y()))
     except Exception:
-        pass
+        log_ignored("wbnm_2025_exporter._feature_centroid_xy")
     try:
         p = geom.centroid().asPoint()
         return (float(p.x()), float(p.y()))
@@ -149,6 +152,7 @@ def _catchment_centroid(features: Iterable[object]) -> Tuple[float, float]:
             if geom is not None and not geom.isNull() and not geom.isEmpty():
                 geoms.append(QgsGeometry(geom))
         except Exception:
+            log_ignored("wbnm_2025_exporter._catchment_centroid")
             continue
     if not geoms:
         return (0.0, 0.0)
@@ -158,7 +162,7 @@ def _catchment_centroid(features: Iterable[object]) -> Tuple[float, float]:
             p = union.centroid().asPoint()
             return (float(p.x()), float(p.y()))
     except Exception:
-        pass
+        log_ignored("wbnm_2025_exporter._catchment_centroid")
     # Fall back to the mean of the per-subarea bounding-box centres.
     centres = []
     for geom in geoms:
@@ -167,6 +171,7 @@ def _catchment_centroid(features: Iterable[object]) -> Tuple[float, float]:
             centres.append(((b.xMinimum() + b.xMaximum()) / 2.0,
                             (b.yMinimum() + b.yMaximum()) / 2.0))
         except Exception:
+            log_ignored("wbnm_2025_exporter._catchment_centroid")
             continue
     if not centres:
         return (0.0, 0.0)
@@ -180,7 +185,7 @@ def _epsg_code(engine) -> int:
         if authid.upper().startswith("EPSG:"):
             return int(authid.split(":", 1)[1])
     except Exception:
-        pass
+        log_ignored("wbnm_2025_exporter._epsg_code")
     return 0
 
 

@@ -37,6 +37,7 @@ from qgis.core import (
 )
 
 from .catchment_geometry import dissolved_reaches, subarea_metrics
+from .compat import enum_member, log_ignored
 
 CENTROIDS = "Centroids"
 ENTRY_POINTS = "EntryPoints"
@@ -103,12 +104,19 @@ class GisOutputError(Exception):
 
 
 def _writer_no_error_code():
-    if hasattr(QgsVectorFileWriter, "NoError"):
-        return QgsVectorFileWriter.NoError
-    writer_error = getattr(QgsVectorFileWriter, "WriterError", None)
-    if writer_error is not None and hasattr(writer_error, "NoError"):
-        return writer_error.NoError
-    return 0
+    """Vector-writer success code, taking the scoped Qt6 enum first."""
+    try:
+        return enum_member(QgsVectorFileWriter, "WriterError", "NoError")
+    except AttributeError:
+        return 0
+
+
+def _writer_action(member: str):
+    """Action-on-existing-file member, taking the scoped Qt6 enum first."""
+    try:
+        return enum_member(QgsVectorFileWriter, "ActionOnExistingFile", member)
+    except AttributeError:
+        return None
 
 
 def _fraction(feat, field_name: str, present: set) -> float:
@@ -136,7 +144,7 @@ def _area_km2(feat) -> float:
             if math.isfinite(area) and area > 0:
                 return area / 1_000_000.0
     except Exception:
-        pass
+        log_ignored("gis_outputs._area_km2")
     return 0.0
 
 
@@ -166,12 +174,9 @@ def _write_layer(path: str, geometry_type: str, fields_spec, rows, crs) -> None:
     options = QgsVectorFileWriter.SaveVectorOptions()
     options.driverName = "ESRI Shapefile"
     options.fileEncoding = "UTF-8"
-    if hasattr(QgsVectorFileWriter, "CreateOrOverwriteFile"):
-        options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
-    else:
-        action_enum = getattr(QgsVectorFileWriter, "ActionOnExistingFile", None)
-        if action_enum is not None:
-            options.actionOnExistingFile = action_enum.CreateOrOverwriteFile
+    overwrite = _writer_action("CreateOrOverwriteFile")
+    if overwrite is not None:
+        options.actionOnExistingFile = overwrite
 
     if hasattr(QgsVectorFileWriter, "writeAsVectorFormatV3"):
         result = QgsVectorFileWriter.writeAsVectorFormatV3(
@@ -211,6 +216,7 @@ def write_model_gis_outputs(
         try:
             features[int(feat["outlet_id"])] = feat
         except Exception:
+            log_ignored("gis_outputs.write_model_gis_outputs")
             continue
 
     outlets = [int(o) for o in model_ids if int(o) in features]

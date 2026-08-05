@@ -53,7 +53,7 @@ from qgis.core import (
 )
 from qgis.gui import QgsMapToolEmitPoint, QgsRubberBand
 
-from .compat import enum_member, qt_enum
+from .compat import enum_member, log_ignored, qt_enum
 from .hydrology_engine import D8HydrologyEngine, HydrologyBuildError, HydrologyCancelled
 from .map_tools import DrawOutletLineTool, DrawMaskPolygonTool
 from .rorb_catg_exporter import RorbCatgExportError, write_rorb_catg_from_engine
@@ -66,13 +66,19 @@ from .gis_outputs import write_model_gis_outputs
 
 
 def _writer_no_error_code():
-    """Returns the vector-writer success code for QGIS 3 or QGIS 4."""
-    if hasattr(QgsVectorFileWriter, "NoError"):
-        return QgsVectorFileWriter.NoError
-    writer_error = getattr(QgsVectorFileWriter, "WriterError", None)
-    if writer_error is not None and hasattr(writer_error, "NoError"):
-        return writer_error.NoError
-    return 0
+    """Returns the vector-writer success code, scoped Qt6 enum first."""
+    try:
+        return enum_member(QgsVectorFileWriter, "WriterError", "NoError")
+    except AttributeError:
+        return 0
+
+
+def _writer_action(member):
+    """Action-on-existing-file member, scoped Qt6 enum first."""
+    try:
+        return enum_member(QgsVectorFileWriter, "ActionOnExistingFile", member)
+    except AttributeError:
+        return None
 
 
 class DDMHydroLogicDock(QDockWidget):
@@ -109,7 +115,7 @@ class DDMHydroLogicDock(QDockWidget):
         except Exception:
             # Signal names/signatures can shift across QGIS/PyQt builds.
             # The layer validity checks below still protect the workflow.
-            pass
+            log_ignored("interactive_dock.__init__")
 
         self._build_ui()
         self.refresh_dem_layers()
@@ -381,7 +387,7 @@ class DDMHydroLogicDock(QDockWidget):
                 self._remove_layer_if_present("highlight_layer")
                 self._remove_layer_if_present("subcatchment_layer")
         except Exception:
-            pass
+            log_ignored("interactive_dock._reset_after_unprojected_crs_cancel")
         self.engine = None
         self.outlet_cells = []
         self.current_assignments = {}
@@ -429,7 +435,7 @@ class DDMHydroLogicDock(QDockWidget):
             try:
                 project.removeMapLayer(layer_id)
             except Exception:
-                pass
+                log_ignored("interactive_dock._remove_mask_layer_if_present")
         self.mask_layer = None
 
         for layer in list(project.mapLayers().values()):
@@ -437,6 +443,7 @@ class DDMHydroLogicDock(QDockWidget):
                 if layer.name().startswith("DDM HydroLogic mask polygon"):
                     project.removeMapLayer(layer.id())
             except Exception:
+                log_ignored("interactive_dock._remove_mask_layer_if_present")
                 continue
 
     def activate_mask_tool(self):
@@ -460,12 +467,12 @@ class DDMHydroLogicDock(QDockWidget):
             from qgis.PyQt.QtWidgets import QToolTip
             QToolTip.hideText()
         except Exception:
-            pass
+            log_ignored("interactive_dock._deactivate_mask_tool")
         try:
             if self.mask_tool is not None and self.canvas.mapTool() == self.mask_tool:
                 self.canvas.unsetMapTool(self.mask_tool)
         except Exception:
-            pass
+            log_ignored("interactive_dock._deactivate_mask_tool")
 
     def _handle_mask_polygon_cancelled(self):
         self._deactivate_mask_tool()
@@ -504,7 +511,7 @@ class DDMHydroLogicDock(QDockWidget):
                     if not fixed.isNull() and not fixed.isEmpty():
                         geom = fixed
             except Exception:
-                pass
+                log_ignored("interactive_dock._handle_mask_polygon")
 
             layer = QgsVectorLayer(
                 f"Polygon?crs={self._canvas_crs_uri()}",
@@ -685,6 +692,7 @@ class DDMHydroLogicDock(QDockWidget):
                 if layer.name() in ("NoData - problematic areas", "DDM HydroLogic mask NoData warning - temporary") or layer.name().startswith("DDM HydroLogic mask NoData warning"):
                     project.removeMapLayer(layer.id())
             except Exception:
+                log_ignored("interactive_dock._remove_nodata_problem_layer_if_present")
                 continue
 
     def _create_nodata_problem_layer(self, checker, info):
@@ -1160,14 +1168,14 @@ class DDMHydroLogicDock(QDockWidget):
                     try:
                         self.canvas.scene().removeItem(band)
                     except Exception:
-                        pass
+                        log_ignored("interactive_dock._clear_outlet_line_overlay")
                 except Exception:
-                    pass
+                    log_ignored("interactive_dock._clear_outlet_line_overlay")
         try:
             if self.draw_tool is not None:
                 self.draw_tool.points = []
         except Exception:
-            pass
+            log_ignored("interactive_dock._clear_outlet_line_overlay")
         self.outlet_line_band = None
         self.outlet_line_bands = []
         self.outlet_line_points = []
@@ -1176,7 +1184,7 @@ class DDMHydroLogicDock(QDockWidget):
         try:
             self.canvas.refresh()
         except Exception:
-            pass
+            log_ignored("interactive_dock._clear_outlet_line_overlay")
 
     def _update_selection_polygon_overlays(self, selection_groups):
         """Draws one non-overlapping light-green dissolved catchment overlay per selection group.
@@ -1249,7 +1257,7 @@ class DDMHydroLogicDock(QDockWidget):
                 self.selection_polygon_band.reset(enum_member(QgsWkbTypes, "GeometryType", "PolygonGeometry"))
                 self.selection_polygon_band.hide()
             except Exception:
-                pass
+                log_ignored("interactive_dock._clear_selection_polygon_overlay")
         self.selection_polygon_band = None
 
         for band in list(getattr(self, "selection_polygon_bands", [])):
@@ -1259,9 +1267,9 @@ class DDMHydroLogicDock(QDockWidget):
                 try:
                     self.canvas.scene().removeItem(band)
                 except Exception:
-                    pass
+                    log_ignored("interactive_dock._clear_selection_polygon_overlay")
             except Exception:
-                pass
+                log_ignored("interactive_dock._clear_selection_polygon_overlay")
         self.selection_polygon_bands = []
         self.selection_polygon_geom = None
 
@@ -1352,6 +1360,7 @@ class DDMHydroLogicDock(QDockWidget):
                                 seen.add(cid)
                                 cells.append(cid)
                         except Exception:
+                            log_ignored("interactive_dock._flow_cells_crossed_by_outlet_geometry")
                             continue
             except Exception:
                 cells = []
@@ -1439,13 +1448,13 @@ class DDMHydroLogicDock(QDockWidget):
                     if not valid_ids or cid in valid_ids:
                         valid_cells.append(cid)
                 except Exception:
+                    log_ignored("interactive_dock._current_rorb_outlet_cell")
                     continue
             if not valid_cells:
                 return None
             return int(max(valid_cells, key=lambda cid: (int(self.engine.accumulation[int(cid)]), int(cid))))
         except Exception:
             return None
-
 
     def _current_rorb_outlet_point(self):
         """Returns an explicit RORB outlet coordinate from the drawn QGIS outlet line.
@@ -1465,7 +1474,7 @@ class DDMHydroLogicDock(QDockWidget):
                 point = self.engine.cell_center(int(outlet_cell))
                 return (float(point.x()), float(point.y()))
         except Exception:
-            pass
+            log_ignored("interactive_dock._current_rorb_outlet_point")
         try:
             if self.outlet_line_points:
                 pts = list(self.outlet_line_points)
@@ -1487,7 +1496,7 @@ class DDMHydroLogicDock(QDockWidget):
                         p = QgsPointXY(transformed[0])
                         return (float(p.x()), float(p.y()))
         except Exception:
-            pass
+            log_ignored("interactive_dock._current_rorb_outlet_point")
         return None
 
     def _show_dependency_or_runtime_error(self, title, exc):
@@ -1951,6 +1960,7 @@ class DDMHydroLogicDock(QDockWidget):
                 if cell_id not in domain_cells:
                     delete_ids.append(int(feat.id()))
             except Exception:
+                log_ignored("interactive_dock._restrict_flow_layer_to_assignment_domain")
                 continue
         if delete_ids:
             try:
@@ -1958,12 +1968,12 @@ class DDMHydroLogicDock(QDockWidget):
                 layer.updateExtents()
                 layer.triggerRepaint()
             except Exception:
-                pass
+                log_ignored("interactive_dock._restrict_flow_layer_to_assignment_domain")
         try:
             self.engine._style_flow_layer(layer)
             self.engine._rebuild_spatial_index()
         except Exception:
-            pass
+            log_ignored("interactive_dock._restrict_flow_layer_to_assignment_domain")
         self.canvas.refresh()
 
     def _tuflow_catchment_groups(self):
@@ -1987,6 +1997,7 @@ class DDMHydroLogicDock(QDockWidget):
             try:
                 upstream = set(int(c) for c in self.engine.collect_upstream(int(outlet_cell)))
             except Exception:
+                log_ignored("interactive_dock._tuflow_catchment_groups")
                 continue
             upstream.add(int(outlet_cell))
             members = [int(o) for o in self.current_assignments if int(o) in upstream]
@@ -2042,7 +2053,7 @@ class DDMHydroLogicDock(QDockWidget):
                 if old_group is not None:
                     root.removeChildNode(old_group)
             except Exception:
-                pass
+                log_ignored("interactive_dock._load_gis_companion_group")
             group = root.insertGroup(0, group_name)
             for path in paths:
                 name = os.path.splitext(os.path.basename(path))[0]
@@ -2056,7 +2067,7 @@ class DDMHydroLogicDock(QDockWidget):
         except Exception:
             # The shapefiles are on disk either way; failing to display them
             # should not turn a completed export into an error.
-            pass
+            log_ignored("interactive_dock._load_gis_companion_group")
         return loaded
 
     def _remove_legacy_rorb_group(self):
@@ -2072,7 +2083,7 @@ class DDMHydroLogicDock(QDockWidget):
                 root.removeChildNode(old_group)
                 self.canvas.refresh()
         except Exception:
-            pass
+            log_ignored("interactive_dock._remove_legacy_rorb_group")
         return []
 
     def _load_exported_gpkg_layers(self, path):
@@ -2090,7 +2101,7 @@ class DDMHydroLogicDock(QDockWidget):
                     self.engine._style_flow_layer(flow_layer)
                 self._save_layer_style_to_gpkg(flow_layer, path, "flow_paths", "DDM Strahler order")
             except Exception:
-                pass
+                log_ignored("interactive_dock._load_exported_gpkg_layers")
             QgsProject.instance().addMapLayer(flow_layer)
             loaded_names.append(flow_layer.name())
 
@@ -2102,7 +2113,7 @@ class DDMHydroLogicDock(QDockWidget):
                     if renderer is not None:
                         sub_layer.setRenderer(renderer.clone())
             except Exception:
-                pass
+                log_ignored("interactive_dock._load_exported_gpkg_layers")
             QgsProject.instance().addMapLayer(sub_layer)
             loaded_names.append(sub_layer.name())
 
@@ -2131,7 +2142,7 @@ class DDMHydroLogicDock(QDockWidget):
         try:
             context.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(layer))
         except Exception:
-            pass
+            log_ignored("interactive_dock._recalculate_subcatchment_area_fields")
         changes = {}
         for feat in layer.getFeatures():
             self._check_abort_from_dock()
@@ -2165,16 +2176,9 @@ class DDMHydroLogicDock(QDockWidget):
         options = QgsVectorFileWriter.SaveVectorOptions()
         options.driverName = "GPKG"
         options.layerName = layer_name
-        if hasattr(QgsVectorFileWriter, "CreateOrOverwriteFile"):
-            options.actionOnExistingFile = (
-                QgsVectorFileWriter.CreateOrOverwriteFile if overwrite_file else QgsVectorFileWriter.CreateOrOverwriteLayer
-            )
-        else:
-            action_enum = getattr(QgsVectorFileWriter, "ActionOnExistingFile", None)
-            if action_enum is not None:
-                options.actionOnExistingFile = (
-                    action_enum.CreateOrOverwriteFile if overwrite_file else action_enum.CreateOrOverwriteLayer
-                )
+        action = _writer_action("CreateOrOverwriteFile" if overwrite_file else "CreateOrOverwriteLayer")
+        if action is not None:
+            options.actionOnExistingFile = action
         if hasattr(QgsVectorFileWriter, "writeAsVectorFormatV3"):
             result = QgsVectorFileWriter.writeAsVectorFormatV3(
                 layer,
@@ -2249,7 +2253,7 @@ class DDMHydroLogicDock(QDockWidget):
             if self.draw_tool is not None:
                 self.draw_tool.reset()
         except Exception:
-            pass
+            log_ignored("interactive_dock.clear_outlet_line")
         gc.collect()
         self.progress.setValue(100)
         self.status_label.setText("Outlet line(s) cleared. Draw new outlet line(s) before processing subcatchments, or process the whole DEM when prompted.")
@@ -2271,7 +2275,7 @@ class DDMHydroLogicDock(QDockWidget):
             self._remove_layer_if_present("highlight_layer")
             self._remove_layer_if_present("subcatchment_layer")
         except Exception:
-            pass
+            log_ignored("interactive_dock._cleanup_after_abort")
         self.current_assignments = {}
         self.outlet_cells = []
         self.selected_highlight_cells = set()
@@ -2284,7 +2288,7 @@ class DDMHydroLogicDock(QDockWidget):
             try:
                 self._remove_layer_if_present("flow_layer")
             except Exception:
-                pass
+                log_ignored("interactive_dock._cleanup_after_abort")
             self.engine = None
 
         gc.collect()
@@ -2345,7 +2349,7 @@ class DDMHydroLogicDock(QDockWidget):
                 QgsProject.instance().removeMapLayer(layer_id)
             except RuntimeError:
                 # The layer was removed between the project lookup and removal.
-                pass
+                log_ignored("interactive_dock._remove_layer_if_present")
         setattr(self.engine, attr_name, None)
         if attr_name == "flow_layer" and self.engine is not None:
             self.engine.spatial_index = None
@@ -2407,8 +2411,10 @@ class DDMHydroLogicDock(QDockWidget):
                 if any(name.startswith(prefix) for prefix in prefixes):
                     to_remove.append(layer.id())
             except RuntimeError:
+                log_ignored("interactive_dock._remove_all_plugin_temporary_layers")
                 continue
             except Exception:
+                log_ignored("interactive_dock._remove_all_plugin_temporary_layers")
                 continue
 
         for layer_id in to_remove:
@@ -2416,9 +2422,9 @@ class DDMHydroLogicDock(QDockWidget):
                 if project.mapLayer(layer_id) is not None:
                     project.removeMapLayer(layer_id)
             except RuntimeError:
-                pass
+                log_ignored("interactive_dock._remove_all_plugin_temporary_layers")
             except Exception:
-                pass
+                log_ignored("interactive_dock._remove_all_plugin_temporary_layers")
 
         if self.engine is not None:
             if include_flow:

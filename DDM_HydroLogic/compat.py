@@ -9,6 +9,33 @@
 # License (the LICENSE file) for more details.
 """Compatibility helpers for QGIS 3/PyQt5 and QGIS 4/PyQt6 enum names."""
 
+import sys
+
+# A handful of messages per site is enough to diagnose a problem; anything more
+# would flood the log panel when a call fails inside a per-cell loop.
+_LOG_LIMIT = 5
+_logged = {}
+
+
+def log_ignored(context=""):
+    """Record a non-fatal error in the QGIS log and carry on.
+
+    The plugin keeps working when a single QGIS call fails, so that one
+    unsupported call on one build does not stop a whole export. Sending the
+    detail to the log panel means those failures can still be traced instead of
+    disappearing silently.
+    """
+    seen = _logged.get(context, 0)
+    if seen >= _LOG_LIMIT:
+        return
+    _logged[context] = seen + 1
+    try:
+        from qgis.core import QgsMessageLog
+        detail = sys.exc_info()[1]
+        QgsMessageLog.logMessage(f"{context}: {detail}".strip(": "), "DDM HydroLogic")
+    except Exception:
+        return
+
 
 def qt_enum(parent, scoped_group_name, member_name):
     """Return a Qt enum member from scoped PyQt6 or flat PyQt5-style names."""

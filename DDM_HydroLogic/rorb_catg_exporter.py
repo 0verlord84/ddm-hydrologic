@@ -24,6 +24,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from qgis.core import QgsPointXY
 
 from .catchment_geometry import downstream_outlet_map, downstream_path, subarea_metrics
+from .compat import log_ignored
 
 
 class RorbCatgExportError(Exception):
@@ -61,13 +62,13 @@ def _feature_area_m2(feat) -> float:
             if math.isfinite(area) and area > 0:
                 return area
     except Exception:
-        pass
+        log_ignored("rorb_catg_exporter._feature_area_m2")
     try:
         area = float(_safe_layer_field(feat, "area_m2", 0.0))
         if math.isfinite(area) and area > 0:
             return area
     except Exception:
-        pass
+        log_ignored("rorb_catg_exporter._feature_area_m2")
     return 0.0
 
 
@@ -106,6 +107,7 @@ def _subcatchment_features_by_outlet(engine) -> Dict[int, object]:
         try:
             outlet_id = int(feat["outlet_id"])
         except Exception:
+            log_ignored("rorb_catg_exporter._subcatchment_features_by_outlet")
             continue
         result[outlet_id] = feat
     if not result:
@@ -592,6 +594,7 @@ def write_rorb_catg_from_engine(
     _write_manual_catg(output_path, str(rorb_version or "6.52"), nodes, reaches, int(outlet_node_id), basin_order, vector_lines)
     return output_path, len(ordered_outlets), len(reaches)
 
+
 def model_id_map(engine, assignments, model_outlet_cell=None):
     """Node numbers as written to the .catg, keyed by outlet cell."""
     sub_features = _subcatchment_features_by_outlet(engine)
@@ -602,7 +605,7 @@ def model_id_map(engine, assignments, model_outlet_cell=None):
             upstream.add(int(model_outlet_cell))
             selected = {o for o in selected if o in upstream}
         except Exception:
-            pass
+            log_ignored("rorb_catg_exporter.model_id_map")
     ordered = sorted(selected, key=lambda cid: (int(engine.accumulation[int(cid)]), int(cid)))
     return ({int(o): str(i) for i, o in enumerate(ordered, start=1)},
             downstream_outlet_map(engine, assignments, selected))

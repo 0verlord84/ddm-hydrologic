@@ -41,6 +41,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from qgis.core import QgsProject
 
+from .compat import log_ignored
+
 NODE_CIRCLE = 134
 LINK_LINE = 136
 SUBAREA_SLOTS = 5  # RAFTS allows up to five sub-areas per node.
@@ -171,6 +173,7 @@ def _subcatchment_features_by_outlet(engine) -> Dict[int, object]:
         try:
             features[int(feat["outlet_id"])] = feat
         except Exception:
+            log_ignored("xprafts_exporter._subcatchment_features_by_outlet")
             continue
     if not features:
         raise XpRaftsExportError(
@@ -187,13 +190,13 @@ def _feature_area_m2(feat) -> float:
             if math.isfinite(area) and area > 0:
                 return area
     except Exception:
-        pass
+        log_ignored("xprafts_exporter._feature_area_m2")
     try:
         area = float(feat["area_m2"])
         if math.isfinite(area) and area > 0:
             return area
     except Exception:
-        pass
+        log_ignored("xprafts_exporter._feature_area_m2")
     return 0.0
 
 
@@ -207,7 +210,7 @@ def _feature_centroid_xy(feat) -> Tuple[float, float]:
             p = point.asPoint()
             return (float(p.x()), float(p.y()))
     except Exception:
-        pass
+        log_ignored("xprafts_exporter._feature_centroid_xy")
     try:
         p = geom.centroid().asPoint()
         return (float(p.x()), float(p.y()))

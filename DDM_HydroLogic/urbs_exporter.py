@@ -30,6 +30,7 @@ import os
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from .catchment_geometry import SLOPE_FLOOR, subarea_metrics
+from .compat import log_ignored
 
 # Written verbatim as the routing-file header; these are model defaults the
 # modeller reviews in URBS.
@@ -62,6 +63,7 @@ def _subcatchment_features_by_outlet(engine) -> Dict[int, object]:
         try:
             features[int(feat["outlet_id"])] = feat
         except Exception:
+            log_ignored("urbs_exporter._subcatchment_features_by_outlet")
             continue
     if not features:
         raise UrbsExportError(
@@ -78,13 +80,13 @@ def _feature_area_km2(feat) -> float:
             if math.isfinite(area) and area > 0:
                 return area / 1_000_000.0
     except Exception:
-        pass
+        log_ignored("urbs_exporter._feature_area_km2")
     try:
         area = float(feat["area_m2"])
         if math.isfinite(area) and area > 0:
             return area / 1_000_000.0
     except Exception:
-        pass
+        log_ignored("urbs_exporter._feature_area_km2")
     return 0.0
 
 

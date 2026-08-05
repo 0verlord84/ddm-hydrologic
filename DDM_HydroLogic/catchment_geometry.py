@@ -24,6 +24,8 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Optional, Set, Tuple
 
+from .compat import log_ignored
+
 # Slopes are floored so routing always has a positive value to work with.
 SLOPE_FLOOR = 0.0005
 
@@ -90,7 +92,7 @@ def centroid_of(feat) -> Tuple[float, float, bool]:
             if surface is not None and not surface.isNull() and not surface.isEmpty():
                 point = surface.asPoint()
         except Exception:
-            pass
+            log_ignored("catchment_geometry.centroid_of")
     if point is None:
         bbox = geom.boundingBox()
         return ((bbox.xMinimum() + bbox.xMaximum()) / 2.0,

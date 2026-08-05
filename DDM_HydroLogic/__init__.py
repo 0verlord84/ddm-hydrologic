@@ -23,7 +23,7 @@ class _DDMHydroLogicLoadFailurePlugin:
             QMessageBox.critical(self.iface.mainWindow(), "DDM HydroLogic could not start", self.message)
         except Exception:
             # If Qt itself is unavailable, QGIS will still shows the original Python console traceback.
-            pass
+            return
 
     def unload(self):
         pass

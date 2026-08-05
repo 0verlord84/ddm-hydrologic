@@ -15,7 +15,7 @@ from qgis.PyQt.QtWidgets import QToolTip
 from qgis.gui import QgsMapTool, QgsRubberBand
 from qgis.core import QgsPointXY, QgsWkbTypes
 
-from .compat import enum_member, qt_enum
+from .compat import enum_member, log_ignored, qt_enum
 
 
 class DrawOutletLineTool(QgsMapTool):
@@ -141,7 +141,7 @@ class DrawMaskPolygonTool(QgsMapTool):
             try:
                 QToolTip.showText(self.canvas.mapToGlobal(event.pos()), self.hover_tip, self.canvas)
             except Exception:
-                pass
+                log_ignored("map_tools.canvasMoveEvent")
         if not self.points:
             return
         self._redraw(QgsPointXY(event.mapPoint()))
