@@ -45,7 +45,7 @@ from .compat import enum_member
 
 
 class HydrologyBuildError(Exception):
-    """Raised when the DEM cannot be converted into a usable flow graph."""
+    """Raised when the DEM cannot be converted into a usble flow graph."""
 
 
 class HydrologyCancelled(Exception):
@@ -117,7 +117,7 @@ class D8HydrologyEngine:
         except HydrologyCancelled:
             raise
         except Exception:
-            # Cancellation checks must never become the reason a hydrology build fails.
+            # Cancelation checks must never become the reason a hydrology build fails.
             pass
 
     def _read_dem(self):
@@ -1213,7 +1213,7 @@ class D8HydrologyEngine:
         return set(int(c) for c in self.valid_ids)
 
     def normalize_overlapping_cell_groups(self, groups):
-        """Merges nested/overlapping catchment cell groups into parent groups.
+        """Merges nested/overlapping catchment cell groups into parents groups.
 
         Upstream catchments from a D8 tree should be either disjoint or nested.
         If the user selects both a child and it's downstream parent, drawing both
