@@ -57,7 +57,6 @@ from .compat import enum_member, qt_enum
 from .hydrology_engine import D8HydrologyEngine, HydrologyBuildError, HydrologyCancelled
 from .map_tools import DrawOutletLineTool, DrawMaskPolygonTool
 from .rorb_catg_exporter import RorbCatgExportError, write_rorb_catg_from_engine
-from .rorb_catg_importer import load_rorb_catg_layers
 from .tuflow_exporter import TUFLOW_LAYERS, TuflowExportError, write_tuflow_from_engine
 from .wbnm_2025_exporter import Wbnm2025ExportError, write_wbnm_2025_from_engine
 from .xprafts_exporter import XpRaftsExportError, write_xprafts_from_engine
@@ -223,7 +222,7 @@ class DDMHydroLogicDock(QDockWidget):
         self.rorb_export_btn = QPushButton("Export to RORB GE (.catg)")
         self.rorb_export_btn.setToolTip(
             "Creates a first-pass RORB GE/RORBwin .catg file from the current flow-path and subcatchment outputs, "
-            "then loads the generated RORB nodes and links into a temporary RORB group in QGIS."
+            "then writes the companion GIS shapefiles into a folder of your choosing."
         )
         export_layout.addWidget(self.rorb_export_btn)
 
@@ -1585,8 +1584,8 @@ class DDMHydroLogicDock(QDockWidget):
                 outlet_name="outlet",
                 model_outlet_cell=outlet_cell,
             )
-            self._progress(78, "Loading generated RORB temporary layers into QGIS")
-            loaded_rorb_layers = self._load_rorb_layers_group_from_catg(output_path)
+            self._progress(78, "Writing the RORB GIS files")
+            self._remove_legacy_rorb_group()
             self._export_gis_companions(
                 "RORB",
                 os.path.dirname(output_path),
@@ -1596,8 +1595,7 @@ class DDMHydroLogicDock(QDockWidget):
             self.progress.setValue(100)
             self.status_label.setText(
                 f"Exported RORB .catg file: {output_path}. "
-                f"Basins/subareas: {basin_count:,}; reaches: {reach_count:,}. "
-                f"Loaded temporary RORB layers: {', '.join(loaded_rorb_layers) if loaded_rorb_layers else 'none'}. " +
+                f"Basins/subareas: {basin_count:,}; reaches: {reach_count:,}. " +
                 ("The drawn outlet line was used as the RORB outlet." if outlet_point is not None else "No drawn outlet line was available, so the outlet was inferred from the terminal drainage point.")
             )
             QMessageBox.information(
@@ -1805,16 +1803,17 @@ class DDMHydroLogicDock(QDockWidget):
             self.active_operation = "tuflow_export"
             self._set_busy(True)
             self._progress(10, "Preparing TUFLOW shapefile export")
-            output_dir, written, total_area_ha = write_tuflow_from_engine(
+            output_dir, written, total_area_ha, catchment_count = write_tuflow_from_engine(
                 self.engine,
                 self.current_assignments,
                 folder,
+                self._tuflow_catchment_groups(),
             )
             self.progress.setValue(100)
             file_names = "\n".join(os.path.basename(path) for path in written)
             self.status_label.setText(
                 f"Exported {len(written)} TUFLOW region shapefiles to {output_dir}. "
-                f"Catchment boundary area: {total_area_ha:,.2f} ha. "
+                f"Catchments: {catchment_count:,}; total area: {total_area_ha:,.2f} ha. "
                 "Materials, soils, codes and plot outputs carry default or blank values. Please review."
             )
             QMessageBox.information(
@@ -1823,9 +1822,11 @@ class DDMHydroLogicDock(QDockWidget):
                 "TUFLOW shapefile export complete.\n\n"
                 f"{output_dir}\n\n"
                 f"{file_names}\n\n"
-                f"Catchment boundary area: {total_area_ha:,.2f} ha\n\n"
-                "Each file holds the subcatchments merged into one boundary polygon, in the DEM CRS. "
-                "Review the blank Material, SoilID, Nest_Level and plot-output attributes before running."
+                f"Catchments: {catchment_count:,}\n"
+                f"Total area: {total_area_ha:,.2f} ha\n\n"
+                "Each file holds one polygon per catchment, in the DEM CRS, numbered in the order the "
+                "outlet lines were drawn. Review the blank Material, SoilID, Nest_Level and plot-output "
+                "attributes before running."
             )
         except HydrologyCancelled:
             self.status_label.setText("TUFLOW shapefile export aborted.")
@@ -1965,6 +1966,34 @@ class DDMHydroLogicDock(QDockWidget):
             pass
         self.canvas.refresh()
 
+    def _tuflow_catchment_groups(self):
+        """Subcatchment outlets draining to each drawn outlet line, in draw order.
+
+        Each drawn line defines its own catchment from everything upstream of it,
+        so nested outlet lines produce nested catchments.
+        """
+        geoms = list(getattr(self, "outlet_line_geoms", []) or [])
+        if not geoms or self.engine is None:
+            return []
+        groups = []
+        for geom in geoms:
+            cells = self._flow_cells_crossed_by_outlet_geometry(geom)
+            if not cells:
+                continue
+            try:
+                outlet_cell = max(cells, key=lambda c: int(self.engine.accumulation[int(c)]))
+            except Exception:
+                outlet_cell = int(cells[0])
+            try:
+                upstream = set(int(c) for c in self.engine.collect_upstream(int(outlet_cell)))
+            except Exception:
+                continue
+            upstream.add(int(outlet_cell))
+            members = [int(o) for o in self.current_assignments if int(o) in upstream]
+            if members:
+                groups.append(members)
+        return groups
+
     def _export_gis_companions(self, model_name, default_dir, prefix, id_map_call, folder=None):
         """Writes and loads the companion shapefiles that go with a model export.
 
@@ -2030,35 +2059,21 @@ class DDMHydroLogicDock(QDockWidget):
             pass
         return loaded
 
-    def _load_rorb_layers_group_from_catg(self, path):
-        """Loads generated RORB temporary layers under a top-of-panel RORB group."""
-        loaded = []
-        project = QgsProject.instance()
-        root = project.layerTreeRoot()
+    def _remove_legacy_rorb_group(self):
+        """Removes the old RORB nodes/links group left by earlier versions.
+
+        The companion shapefiles now cover the node and link geometry, so the
+        temporary layers are no longer created.
+        """
         try:
+            root = QgsProject.instance().layerTreeRoot()
             old_group = root.findGroup("RORB")
             if old_group is not None:
                 root.removeChildNode(old_group)
+                self.canvas.refresh()
         except Exception:
             pass
-        group = root.insertGroup(0, "RORB")
-
-        def add_to_group(layer):
-            if layer is None or not layer.isValid():
-                return
-            project.addMapLayer(layer, False)
-            group.addLayer(layer)
-            loaded.append(layer.name())
-
-        try:
-            nodes_layer, links_layer = load_rorb_catg_layers(path, crs_uri=self._canvas_crs_uri())
-            add_to_group(links_layer)
-            add_to_group(nodes_layer)
-        except Exception:
-            pass
-
-        self.canvas.refresh()
-        return loaded
+        return []
 
     def _load_exported_gpkg_layers(self, path):
         """Loads the saved GeoPackage outputs back into the current QGIS project."""

@@ -61,7 +61,7 @@ _FIELD_TYPES = {
 TUFLOW_LAYERS = [
     ("2d_rf__s1_s2_e1_e2_e3_EXG_001_R",
      [("Name", "string", 100, 0), ("f1", "double", 15, 5), ("f2", "double", 15, 5)],
-     ["Rain_001", 1.0, 1.0]),
+     ["Rain_{i:03d}", 1.0, 1.0]),
     ("2d_qnl__s1_s2_e1_e2_e3_EXG_001_R",
      [("Nest_Level", "integer", 8, 0)],
      [None]),
@@ -73,7 +73,7 @@ TUFLOW_LAYERS = [
      [None]),
     ("2d_loc__s1_s2_e1_e2_e3_EXG_001_R",
      [("Comment", "string", 250, 0)],
-     ["Region_001"]),
+     ["Region_{i:03d}"]),
     ("2d_code__s1_s2_e1_e2_e3_EXG_001_R",
      [("Code", "integer", 8, 0)],
      [1]),
@@ -222,7 +222,19 @@ def _transform_to_dem_crs(geometry: "QgsGeometry", source_layer, dem_crs) -> "Qg
 
 # --- writing one region shapefile -------------------------------------------
 
-def _write_region_shapefile(path: str, fields_spec, values, geometry: "QgsGeometry", crs) -> None:
+def _values_for(values, index: int) -> list:
+    """Fill in the catchment number on the values that carry one."""
+    resolved = []
+    for value in values:
+        if isinstance(value, str) and "{i" in value:
+            resolved.append(value.format(i=int(index)))
+        else:
+            resolved.append(value)
+    return resolved
+
+
+def _write_region_shapefile(path: str, fields_spec, values, boundaries, crs) -> None:
+    """Write one region layer holding a polygon per catchment."""
     layer = QgsVectorLayer("MultiPolygon", os.path.basename(path), "memory")
     if not layer.isValid():
         raise TuflowExportError("QGIS could not create an in-memory layer for the export.")
@@ -233,10 +245,16 @@ def _write_region_shapefile(path: str, fields_spec, values, geometry: "QgsGeomet
     provider.addAttributes([_make_field(*spec) for spec in fields_spec])
     layer.updateFields()
 
-    feature = QgsFeature(layer.fields())
-    feature.setGeometry(QgsGeometry(geometry))
-    feature.setAttributes(list(values))
-    provider.addFeatures([feature])
+    features = []
+    for index, geometry in enumerate(boundaries, start=1):
+        if geometry is None or geometry.isNull() or geometry.isEmpty():
+            continue
+        feature = QgsFeature(layer.fields())
+        feature.setGeometry(QgsGeometry(geometry))
+        feature.setAttributes(_values_for(values, index))
+        features.append(feature)
+    if features:
+        provider.addFeatures(features)
     layer.updateExtents()
 
     options = QgsVectorFileWriter.SaveVectorOptions()
@@ -278,10 +296,16 @@ def write_tuflow_from_engine(
     engine,
     assignments: Dict[int, Iterable[int]],
     output_dir: str,
-) -> Tuple[str, List[str], float]:
+    catchment_groups: Optional[List[Iterable[int]]] = None,
+) -> Tuple[str, List[str], float, int]:
     """Writes first-pass TUFLOW region shapefiles into ``output_dir``.
 
-    Returns ``(output_dir, written_paths, total_area_ha)``.
+    ``catchment_groups`` lists the subcatchment outlets belonging to each drawn
+    outlet line, in the order the lines were drawn. Each group becomes its own
+    polygon in every region layer, numbered Rain_001, Rain_002 and so on. Without
+    it the whole model is written as a single catchment.
+
+    Returns ``(output_dir, written_paths, total_area_ha, catchment_count)``.
     """
     if engine is None:
         raise TuflowExportError("No DEM flow graph is available. Press Compute first.")
@@ -297,18 +321,28 @@ def write_tuflow_from_engine(
             "No processed subcatchments with matching outlet_id values are available to export."
         )
 
-    chosen = [features[outlet] for outlet in sorted(selected)]
-    total_area_ha = sum(_feature_area_m2(feat) for feat in chosen) / 10_000.0
+    groups: List[List[int]] = []
+    for group in (catchment_groups or []):
+        members = [int(o) for o in group if int(o) in selected]
+        if members:
+            groups.append(members)
+    if not groups:
+        groups = [sorted(selected)]
 
-    boundary = _dissolved_boundary(chosen)
     crs = _dem_crs(engine)
-    boundary = _transform_to_dem_crs(boundary, engine.subcatchment_layer, crs)
+    boundaries = []
+    total_area_ha = 0.0
+    for members in groups:
+        chosen = [features[outlet] for outlet in sorted(members)]
+        total_area_ha += sum(_feature_area_m2(feat) for feat in chosen) / 10_000.0
+        boundary = _dissolved_boundary(chosen)
+        boundaries.append(_transform_to_dem_crs(boundary, engine.subcatchment_layer, crs))
 
     os.makedirs(os.path.abspath(output_dir), exist_ok=True)
     written: List[str] = []
     for base_name, fields_spec, values in TUFLOW_LAYERS:
         path = os.path.join(output_dir, base_name + ".shp")
-        _write_region_shapefile(path, fields_spec, values, boundary, crs)
+        _write_region_shapefile(path, fields_spec, values, boundaries, crs)
         written.append(path)
 
-    return output_dir, written, round(total_area_ha, 3)
+    return output_dir, written, round(total_area_ha, 3), len(boundaries)

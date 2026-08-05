@@ -41,7 +41,7 @@ Current version: **2.1** · QGIS 3.22 LTR and 4.x
 ## Outputs
 
 - **Export flow paths and subcatchments to GeoPackage** writes same-order Strahler reaches and subcatchment polygons. The default filename is `DDM_HydroLogic_outputs_version_.gpkg`.
-- **Export to RORB (.catg)** writes a first-pass RORBwin/RORB GE `.catg` file using a self-contained connected node-link writer. Sub-area nodes are placed on the main stream adjacent to the sub-area centroid, where the sub-area's rainfall-excess enters the channel network, and reach lengths are measured along the stream between adjacent nodes. The drawn outlet line is used to create the explicit RORB outlet node where available, and the export validates that every node drains to that outlet before writing (tested in RORB v6.52). DDM HydroLogic automatically loads temporary **RORB nodes** and **RORB links**.
+- **Export to RORB (.catg)** writes a first-pass RORBwin/RORB GE `.catg` file using a self-contained connected node-link writer. Sub-area nodes are placed on the main stream adjacent to the sub-area centroid, where the sub-area's rainfall-excess enters the channel network, and reach lengths are measured along the stream between adjacent nodes. The drawn outlet line is used to create the explicit RORB outlet node where available, and the export validates that every node drains to that outlet before writing (tested in RORB v6.52). The node and link geometry comes out in the companion shapefiles.
 - **Export to WBNM 2025 (.wbn)** writes a first-pass WBNM runfile (see notes below).
 - **Export to XP-RAFTS (.xpx)** writes a first-pass XP-RAFTS exchange file (see notes below).
 - **Export TUFLOW files (.shp)** writes TUFLOW regions shp into a chosen folder. The final catchment will be included in the scaffoldings of the following: 2d_code, 2d_loc, 2d_rf, 2d_po, 2d_mat, 2d_qnl and 2d_soil.
@@ -73,8 +73,11 @@ selected, so the imported model shows only geometries.
 
 ## TUFLOW export notes
 
-DDM HydroLogic dissolves all processed subcatchments into one topologically
-valid catchment polygon and writes it into each shapefile retaining the same CRS of the source DEM:
+DDM HydroLogic dissolves the processed subcatchments into a topologically valid
+catchment polygon and writes it into each shapefile retaining the same CRS of the
+source DEM. Draw more than one outlet line and you get one catchment per outlet,
+numbered in the order the lines were drawn: Rain_001, Rain_002 and so on in the
+2d_rf layer, Region_001, Region_002 in 2d_loc, and Code 1 on every 2d_code region:
 
 The filenames use the `s1_s2_e1_e2_e3_EXG_001` scenario/event placeholder name.
 Field names, types, widths and precisions follow the TUFLOW 2026.0.0 data formats.
@@ -102,7 +105,7 @@ the CRS of the DEM and named after the model file:
 | `<Model>_Centroids.shp` | the subarea centroids |
 | `<Model>_EntryPoints.shp` | the point on each subarea's main stream where its rainfall-excess enters the channel network |
 | `<Model>_NodalLinks.shp` | the routing topology, `From_ID` to `To_ID` |
-| `<Model>_Streams.shp` | the Strahler-ordered stream network |
+| `<Model>_Streams.shp` | the stream network, dissolved by Strahler order within each subarea |
 
 Each layer carries `Model_ID`, the subarea label exactly as it appears in the model
 file (`1`, `2`, `3` for URBS, `S001` for WBNM and XP-RAFTS, the node number for

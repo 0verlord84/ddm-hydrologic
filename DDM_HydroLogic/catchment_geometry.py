@@ -215,6 +215,102 @@ def catchment_profile(engine, outlet_cell: int, member: Set[int]) -> List[int]:
     return path
 
 
+def dissolved_reaches(engine, cells) -> List[Tuple[List[int], int, float]]:
+    """Merge a subarea's displayed flow-path cells into Strahler reaches.
+
+    Consecutive cells are joined while they share the same Strahler order, the
+    same way the exported flow-path layer is built. A reach is cut where the
+    order changes, where the run leaves the subarea, or where two same-order
+    branches meet and the join would be ambiguous.
+
+    Returns ``(cells, strahler, length_m)`` per reach, ordered from the lowest
+    order upwards so the layer draws small streams first.
+    """
+    displayed = getattr(engine, "cell_to_feature", {}) or {}
+    order_by = getattr(engine, "display_strahler_by_cell", {}) or {}
+    upstream = getattr(engine, "upstream", {})
+    downstream = getattr(engine, "downstream", None)
+
+    pool = {int(c) for c in cells if int(c) in displayed}
+    if not pool:
+        return []
+
+    def order_of(cell_id: int) -> int:
+        try:
+            return int(order_by.get(int(cell_id), 1) or 1)
+        except Exception:
+            return 1
+
+    def same_order_parents(cell_id: int) -> List[int]:
+        return [int(u) for u in upstream.get(int(cell_id), [])
+                if int(u) in pool and order_of(u) == order_of(cell_id)]
+
+    def can_merge(cell_id: int, next_cell: int) -> bool:
+        if int(next_cell) not in pool:
+            return False
+        if order_of(cell_id) != order_of(next_cell):
+            return False
+        parents = same_order_parents(int(next_cell))
+        return len(parents) == 1 and int(parents[0]) == int(cell_id)
+
+    def has_merge_parent(cell_id: int) -> bool:
+        parents = same_order_parents(int(cell_id))
+        if len(parents) != 1:
+            return False
+        return can_merge(int(parents[0]), int(cell_id))
+
+    def sort_key(cell_id: int):
+        return (order_of(cell_id), accumulation_of(engine, cell_id), int(cell_id))
+
+    visited: Set[int] = set()
+    runs: List[List[int]] = []
+
+    def build(start_cell: int) -> List[int]:
+        run: List[int] = []
+        current = int(start_cell)
+        while current in pool and current not in visited:
+            run.append(current)
+            visited.add(current)
+            try:
+                nxt = int(downstream[current])
+            except Exception:
+                break
+            if nxt < 0 or nxt in visited or not can_merge(current, nxt):
+                break
+            current = nxt
+        return run
+
+    for start in sorted([c for c in pool if not has_merge_parent(c)], key=sort_key):
+        if start in visited:
+            continue
+        run = build(start)
+        if run:
+            runs.append(run)
+    # Anything left over is its own reach rather than being dropped.
+    for cell_id in sorted(pool, key=sort_key):
+        if cell_id in visited:
+            continue
+        run = build(cell_id)
+        if run:
+            runs.append(run)
+
+    reaches: List[Tuple[List[int], int, float]] = []
+    for run in runs:
+        path = list(run)
+        try:
+            last_down = int(downstream[int(run[-1])])
+        except Exception:
+            last_down = -1
+        # Carry the line to the next cell centre so reaches meet on the map.
+        if last_down >= 0:
+            path.append(last_down)
+        if len(path) < 2:
+            continue
+        reaches.append((path, order_of(run[-1]), path_length_m(engine, path)))
+    reaches.sort(key=lambda item: (item[1], -item[2]))
+    return reaches
+
+
 def downstream_outlet_map(engine, assignments, selected) -> Dict[int, Optional[int]]:
     """Map each selected subarea outlet to the next selected outlet downstream.
 

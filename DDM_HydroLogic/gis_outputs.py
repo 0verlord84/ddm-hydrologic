@@ -36,7 +36,7 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
-from .catchment_geometry import accumulation_of, cell_distance, subarea_metrics
+from .catchment_geometry import dissolved_reaches, subarea_metrics
 
 CENTROIDS = "Centroids"
 ENTRY_POINTS = "EntryPoints"
@@ -229,10 +229,6 @@ def write_model_gis_outputs(
     number_of = {int(o): _numeric_id(model_ids[int(o)], index)
                  for index, o in enumerate(outlets, start=1)}
 
-    displayed = getattr(engine, "cell_to_feature", {}) or {}
-    strahler_by_cell = getattr(engine, "display_strahler_by_cell", {}) or {}
-    downstream_cells = getattr(engine, "downstream", None)
-
     subarea_rows = []
     centroid_rows = []
     entry_rows = []
@@ -287,26 +283,17 @@ def write_model_gis_outputs(
                 ],
             ))
 
-        # Streams: every displayed flow-path segment inside this sub-area.
-        for cell in (assignments.get(outlet) or []):
-            cell = int(cell)
-            if cell not in displayed:
-                continue
-            try:
-                down = int(downstream_cells[cell])
-            except Exception:
-                down = -1
-            if down < 0:
-                continue
-            a = engine.cell_center(cell)
-            b = engine.cell_center(down)
+        # Streams: this sub-area's flow paths merged into Strahler reaches. Reaches
+        # stop at the sub-area boundary so every line keeps a valid sub-area id.
+        for path, strahler, length_m in dissolved_reaches(engine, assignments.get(outlet) or []):
+            points = [QgsPointXY(engine.cell_center(int(c))) for c in path]
             stream_rows.append((
-                QgsGeometry.fromPolylineXY([QgsPointXY(a), QgsPointXY(b)]),
+                QgsGeometry.fromPolylineXY(points),
                 [
                     int(number_of[int(outlet)]),
                     str(model_ids[int(outlet)]),
-                    int(strahler_by_cell.get(cell, 1) or 1),
-                    round(cell_distance(engine, cell, down) / 1000.0, 5),
+                    int(strahler),
+                    round(float(length_m) / 1000.0, 5),
                 ],
             ))
 
