@@ -24,7 +24,7 @@ Setting up a hydrologic model usually means a few hours of GIS prep work before 
 
 It is important to note that all hydrological/hydraulic choices, such as rainfall, losses, Manning's coefficients, subcatchment types and slope, impervious fractions, etc.. have been deliberately left blank or default values.
 
-Current version: **2.2** · QGIS 3.22 LTR and 4.x
+Current version: **2.1** · QGIS 3.22 LTR and 4.x
 
 ## Workflow
 
