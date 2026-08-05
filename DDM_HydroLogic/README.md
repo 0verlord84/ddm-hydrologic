@@ -3,7 +3,7 @@
 **From DEM to model-ready catchments in QGIS.**
 
 **v2.1 now features:**
-1. Export to URBS (.vec routing file and .csv catchment data file) - Special thanks to Callan Shonrock!
+1. Export to URBS (.vec routing file and .csv catchment data file) - Credits: Callan Shonrock
 2. Multiple outlet lines can be drawn for multi-outlet models
 3. Every model export has got companion shapefiles: subareas, centroids, entry points, nodal links and streams
 
@@ -46,6 +46,12 @@ Current version: **2.1** · QGIS 3.22 LTR and 4.x
 - **Export to XP-RAFTS (.xpx)** writes a first-pass XP-RAFTS exchange file (see notes below).
 - **Export TUFLOW files (.shp)** writes TUFLOW regions shp into a chosen folder. The final catchment will be included in the scaffoldings of the following: 2d_code, 2d_loc, 2d_rf, 2d_po, 2d_mat, 2d_qnl and 2d_soil.
 - **Export to URBS (.vec/.csv)** writes a URBS routing vector file and catchment data file into a chosen folder (see notes below).
+
+## RORB 6.52 export notes
+
+The RORB export method outputs a .catg file that can be ingested straight into RORB
+Graphical Editor (GE). Most of the parameters have been deliberately left either balnk
+or with default values.
 
 ## WBNM 2025 export notes
 
