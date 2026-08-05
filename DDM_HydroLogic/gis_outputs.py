@@ -44,33 +44,58 @@ NODAL_LINKS = "NodalLinks"
 SUBAREAS = "Subareas"
 STREAMS = "Streams"
 
-# (name, QVariant type, length, precision)
+# QVariant type plus the memory-provider type name for each field kind.
+_FIELD_TYPES = {
+    "string": (QVariant.String, "string"),
+    "integer": (QVariant.Int, "integer"),
+    "double": (QVariant.Double, "double"),
+}
+
+# (name, kind, length, precision)
 _SUBAREA_FIELDS = [
-    ("ID", QVariant.Int, 9, 0),
-    ("Model_ID", QVariant.String, 20, 0),
-    ("Area_km2", QVariant.Double, 15, 5),
-    ("CatSlope", QVariant.Double, 15, 5),
-    ("Length_km", QVariant.Double, 15, 5),
-    ("Slope_m_m", QVariant.Double, 15, 5),
-    ("FracImp", QVariant.Double, 15, 5),
-    ("FracUrban", QVariant.Double, 15, 5),
-    ("FracForest", QVariant.Double, 15, 5),
-    ("Downstream", QVariant.Int, 9, 0),
+    ("ID", "integer", 9, 0),
+    ("Model_ID", "string", 20, 0),
+    ("Area_km2", "double", 15, 5),
+    ("CatSlope", "double", 15, 5),
+    ("Length_km", "double", 15, 5),
+    ("Slope_m_m", "double", 15, 5),
+    ("FracImp", "double", 15, 5),
+    ("FracUrban", "double", 15, 5),
+    ("FracForest", "double", 15, 5),
+    ("Downstream", "integer", 9, 0),
 ]
 
 _LINK_FIELDS = [
-    ("From_ID", QVariant.Int, 9, 0),
-    ("To_ID", QVariant.Int, 9, 0),
-    ("ID", QVariant.Int, 9, 0),
-    ("Model_ID", QVariant.String, 20, 0),
+    ("From_ID", "integer", 9, 0),
+    ("To_ID", "integer", 9, 0),
+    ("ID", "integer", 9, 0),
+    ("Model_ID", "string", 20, 0),
 ]
 
 _STREAM_FIELDS = [
-    ("ID", QVariant.Int, 9, 0),
-    ("Model_ID", QVariant.String, 20, 0),
-    ("Strahler", QVariant.Int, 9, 0),
-    ("Length_km", QVariant.Double, 15, 5),
+    ("ID", "integer", 9, 0),
+    ("Model_ID", "string", 20, 0),
+    ("Strahler", "integer", 9, 0),
+    ("Length_km", "double", 15, 5),
 ]
+
+
+def _make_field(name: str, kind: str, width: int, precision: int) -> "QgsField":
+    qvariant_type, type_name = _FIELD_TYPES[kind]
+    return QgsField(name, qvariant_type, type_name, width, precision)
+
+
+def _numeric_id(label, fallback: int) -> int:
+    """Numeric id taken from a model label, so ID lines up with Model_ID.
+
+    URBS numbers its sub-areas directly, WBNM and XP-RAFTS use names like S001;
+    both reduce to the same integer. Anything without digits keeps its position.
+    """
+    digits = "".join(ch for ch in str(label) if ch.isdigit())
+    try:
+        return int(digits) if digits else int(fallback)
+    except Exception:
+        return int(fallback)
 
 
 class GisOutputError(Exception):
@@ -123,7 +148,7 @@ def _write_layer(path: str, geometry_type: str, fields_spec, rows, crs) -> None:
     if crs is not None:
         layer.setCrs(crs)
     provider = layer.dataProvider()
-    provider.addAttributes([QgsField(n, t, "", ln, pr) for (n, t, ln, pr) in fields_spec])
+    provider.addAttributes([_make_field(n, kind, ln, pr) for (n, kind, ln, pr) in fields_spec])
     layer.updateFields()
 
     features = []
@@ -191,7 +216,7 @@ def write_model_gis_outputs(
     outlets = [int(o) for o in model_ids if int(o) in features]
     if not outlets:
         raise GisOutputError("No subcatchments matched the model outputs, so no GIS files were written.")
-    outlets.sort(key=lambda o: str(model_ids[int(o)]))
+    outlets.sort(key=lambda o: _numeric_id(model_ids[int(o)], o))
 
     try:
         crs = engine.dem_layer.crs()
@@ -201,7 +226,12 @@ def write_model_gis_outputs(
     metrics = subarea_metrics(engine, features, assignments, outlets)
     # Numeric ids keep the shapefile tables joinable even where a model labels its
     # sub-areas with text; Model_ID carries the label itself.
-    number_of = {int(o): index for index, o in enumerate(outlets, start=1)}
+    number_of = {int(o): _numeric_id(model_ids[int(o)], index)
+                 for index, o in enumerate(outlets, start=1)}
+
+    displayed = getattr(engine, "cell_to_feature", {}) or {}
+    strahler_by_cell = getattr(engine, "display_strahler_by_cell", {}) or {}
+    downstream_cells = getattr(engine, "downstream", None)
 
     subarea_rows = []
     centroid_rows = []
@@ -258,9 +288,6 @@ def write_model_gis_outputs(
             ))
 
         # Streams: every displayed flow-path segment inside this sub-area.
-        displayed = getattr(engine, "cell_to_feature", {}) or {}
-        strahler_by_cell = getattr(engine, "display_strahler_by_cell", {}) or {}
-        downstream_cells = getattr(engine, "downstream", None)
         for cell in (assignments.get(outlet) or []):
             cell = int(cell)
             if cell not in displayed:
