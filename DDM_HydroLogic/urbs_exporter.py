@@ -13,14 +13,14 @@ file) from the processed subcatchments.
 URBS reads a catchment as two files: a routing vector file describing the tree of
 RAIN / ADD RAIN / ROUTE THRU commands with STORE. / GET. branch markers, and a
 catchment data file listing each subarea's area, land-use fractions and catchment
-slope. Both are built here from the subcatchment topology.
+slope. Both are built from the subcatchment topology.
 
 Rainfall-excess is taken to enter at the subarea centroid, so a headwater subarea
 routes its own runoff over the centroid-to-outlet half of its main stream, and a
 subarea with upstream inflow routes that inflow to the centroid before adding its
 own rain and routing the combined flow on to the outlet. Where the centroid falls
-outside its own polygon the split is not meaningful, so the whole main stream
-length is used instead.
+outside its own polygon (asymmetry assumed), the whole main stream length is 
+used instead.
 """
 
 from __future__ import annotations
@@ -148,7 +148,7 @@ def _downstream_map(engine, assignments, selected) -> Dict[int, Optional[int]]:
 
 def _all_upstream(subarea: str, upstream: Dict[str, List[str]]) -> List[str]:
     """Every subarea upstream of ``subarea``. Iterative depth-first with a
-    cycle guard, so a malformed topology raises instead of looping forever."""
+    cycle guard, so a malformed topology raises instead of being stuck in an infinite loop."""
     if subarea not in upstream:
         return []
     out: List[str] = []
@@ -283,7 +283,7 @@ def _routing_tree_lines(
     return lines
 
 
-# --- the export -----------------------------------------------------------
+# --- OUTPUTS -----------------------------------------------------------
 
 def write_urbs_from_engine(
     engine,
@@ -334,8 +334,7 @@ def write_urbs_from_engine(
         stream_lengths[sub_id] = length_km
         stream_slopes[sub_id] = float(info["channel_slope"])
         # Rain enters at the centroid, so a headwater routes half its stream. On a
-        # subarea whose centroid falls outside the polygon that split means little,
-        # so the whole stream length is used.
+        # subarea whose centroid falls outside the polygon the whole stream length is used.
         rain_lengths[sub_id] = length_km / 2.0 if info["centroid_inside"] else length_km
 
         downstream_outlet = ds_map.get(int(outlet))
