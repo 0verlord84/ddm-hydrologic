@@ -2,14 +2,14 @@
 
 **From DEM to model-ready catchments in QGIS.**
 
+**v2.1 now features:**
+1. Export to URBS (.vec routing file and .csv catchment data file) - Special thanks to Callan Shonrock!
+2. Multiple outlet lines can be drawn for multi-outlet models
+3. Every model export has got companion shapefiles: subareas, centroids, entry points, nodal links and streams
+
 **v2.0 now features:**
 1. Retro compatibility with QGIS 3.22 LTR (tested on v3.22.16)
 2. Faster sub catchment processing and selection
-
-**v2.0.2 now features:**
-1. Export to URBS (.vec routing file and .csv catchment data file)
-2. Multiple outlet lines can be drawn for multi-outlet models
-3. Companion shapefiles written with every model export (subareas, centroids, entry points, nodal links and streams)
 
 **INTRO**
 
@@ -19,11 +19,12 @@ Setting up a hydrologic model usually means a few hours of GIS prep work before 
 - **RORB** `.catg` GE-ready catchment file,
 - **WBNM** `.wbn` runfile,
 - **XP-RAFTS** `.xpx` exchange file,
+- **URBS** `.vec` and `.csv`,
 - or some of the most popular **TUFLOW** xxx_R.shp.
 
-It is important to note that all hydrological/hydraulic choices, such as rainfall, losses, Manning's coefficients, subcatchment types, impervious fractions, etc.. have been deliberately left blank or default values.
+It is important to note that all hydrological/hydraulic choices, such as rainfall, losses, Manning's coefficients, subcatchment types and slope, impervious fractions, etc.. have been deliberately left blank or default values.
 
-Current version: **2.0.2** · QGIS 3.22 LTR and 4.x
+Current version: **2.1** · QGIS 3.22 LTR and 4.x
 
 ## Workflow
 
@@ -35,6 +36,7 @@ Current version: **2.0.2** · QGIS 3.22 LTR and 4.x
 6. (Optional) Draw an outlet line -> Recommended for hydrological modelling exports.
 7. Enter a minimum subcatchment size in m2. (Default = 100,000 m²)
 8. Press **Process subcatchments**. If successful, the plugin reports temporal layers with spatial representation of subcatchments and strahler-ordered flow lines.
+9. Export vectors as a geopackage or straight into your favourite hydrological model and go from there.
 
 ## Outputs
 
@@ -79,7 +81,7 @@ Field names, types, widths and precisions follow the TUFLOW 2026.0.0 data format
 
 ## URBS export notes
 
-DDM HydroLogic writes two URBS input files into a chosen folder: a routing vector
+DDM HydroLogic writes two UBRS input files into a chosen folder: a routing vector
 file (`URBS_RoutingFile.vec`) and a catchment data file (`URBS_SubcatFile.csv`).
 The routing file lists the subareas as RAIN / ADD RAIN / ROUTE THRU commands with
 STORE. / GET. branch markers, and multiple outlets are supported. Reach lengths (L)
@@ -96,7 +98,7 @@ the CRS of the DEM and named after the model file:
 
 | File | Holds |
 | --- | --- |
-| `<Model>_Subareas.shp` | the subcatchment polygons |
+| `<Model>_Subareas.shp` | the subcathment polygons |
 | `<Model>_Centroids.shp` | the subarea centroids |
 | `<Model>_EntryPoints.shp` | the point on each subarea's main stream where its rainfall-excess enters the channel network |
 | `<Model>_NodalLinks.shp` | the routing topology, `From_ID` to `To_ID` |
@@ -105,7 +107,7 @@ the CRS of the DEM and named after the model file:
 Each layer carries `Model_ID`, the subarea label exactly as it appears in the model
 file (`1`, `2`, `3` for URBS, `S001` for WBNM and XP-RAFTS, the node number for
 RORB), so a node in the `.catg`, `.vec`, `.csv`, `.wbn` or `.xpx` can be found on
-the map and the other way round. The files are loaded into their own QGIS group
+the map and the other way round. The files are loaded into their onw QGIS group
 after each export.
 
 ## Scripting maintenance notes
