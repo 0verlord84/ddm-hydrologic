@@ -2,7 +2,7 @@
 
 **From DEM to model-ready catchments in QGIS.**
 
-**v2.10 now features:**
+**v2.1 now features:**
 1. Export to URBS (.vec routing file and .csv catchment data file) - Credits: Callan Shonrock
 2. Multiple outlet lines can be drawn for multi-outlet models
 3. Every model export has got companion shapefiles: subareas, centroids, entry points, nodal links and streams
@@ -24,7 +24,7 @@ Setting up a hydrologic model usually means a few hours of GIS prep work before 
 
 It is important to note that all hydrological/hydraulic choices, such as rainfall, losses, Manning's coefficients, subcatchment types and slope, impervious fractions, etc.. have been deliberately left blank or default values.
 
-Current version: **2.10** · QGIS 3.22 LTR and 4.x
+Current version: **2.1** · QGIS 3.22 LTR and 4.x
 
 ## Workflow
 
