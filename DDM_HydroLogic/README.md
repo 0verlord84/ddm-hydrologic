@@ -24,7 +24,7 @@ Setting up a hydrologic model usually means a few hours of GIS prep work before 
 
 It is important to note that all hydrological/hydraulic choices, such as rainfall, losses, Manning's coefficients, subcatchment types and slope, impervious fractions, etc.. have been deliberately left blank or default values.
 
-Current version: **2.1** · QGIS 3.22 LTR and 4.x
+Current version: **2.2** · QGIS 3.22 LTR and 4.x
 
 ## Workflow
 
@@ -112,6 +112,12 @@ the CRS of the DEM and named after the model file:
 | `<Model>_EntryPoints.shp` | the point on each subarea's main stream where its rainfall-excess enters the channel network |
 | `<Model>_NodalLinks.shp` | the routing topology, `From_ID` to `To_ID` |
 | `<Model>_Streams.shp` | the stream network, dissolved by Strahler order within each subarea |
+
+Two slope fields are written, both equal-area slopes in m/m: `CatSlope` runs from
+the subarea's high point down to its outlet (the whole catchment, hillslope
+included), while `Slope_m_m` follows the main channel only. RORB reach slopes come
+from the channel one and XP-RAFTS `SC` and URBS `CS` come from the catchment one,
+each converted to the units that model expects.
 
 Each layer carries `Model_ID`, the subarea label exactly as it appears in the model
 file (`1`, `2`, `3` for URBS, `S001` for WBNM and XP-RAFTS, the node number for

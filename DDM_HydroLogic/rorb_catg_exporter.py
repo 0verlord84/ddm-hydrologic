@@ -270,7 +270,13 @@ def _route_vector_lines(upstream: Dict[int, List[int]], downstream: Dict[int, in
         if reach is None:
             raise RorbCatgExportError("A RORB basin node is missing its downstream reach. Recompute subcatchments and export again.")
         length_km = max(0.0, float(reach["length_m"]) / 1000.0)
-        lines.append(f"{code}, {length_km:8.3f},  -99")
+        # Natural and drowned reaches skip the slope item; unlined and lined
+        # reaches carry it between the length and the -99 terminator.
+        if int(reach.get("reach_type", 1) or 1) in (2, 3):
+            slope_pct = max(0.0, float(reach.get("slope", 0.0) or 0.0))
+            lines.append(f"{code}, {length_km:8.3f}, {slope_pct:8.3f},  -99")
+        else:
+            lines.append(f"{code}, {length_km:8.3f},  -99")
         basin_order.append(int(node_id))
 
     outlet_children = sorted(upstream.get(int(outlet_node_id), []), key=lambda n: (len(upstream.get(int(n), [])), int(n)), reverse=True)
@@ -572,7 +578,8 @@ def write_rorb_catg_from_engine(
             "ds_node": int(ds_node),
             "reach_type": reach_type_value,
             "length_m": max(0.0, _distance(reach_points)),
-            "slope": 0.0,
+            # RORB records reach slope as a percentage (manual Table 2-2).
+            "slope": round(float(metrics[int(outlet_id)]["channel_slope"]) * 100.0, 3),
             "points": reach_points,
         })
 

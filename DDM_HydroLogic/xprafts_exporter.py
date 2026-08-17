@@ -41,6 +41,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from qgis.core import QgsProject
 
+from .catchment_geometry import subarea_metrics
 from .compat import log_ignored
 
 NODE_CIRCLE = 134
@@ -69,7 +70,7 @@ NODE_SUBAREA_FIELDS = [
     ("NCTL", "no", "0"),
     ("PERN", "0.035", "0.025"),     # pervious Manning's n
     ("QN", "-0.285000", "-0.285000"),
-    ("SC", "0.70", "0.001"),        # average sub-area slope (%) - overwritten
+    ("SC", "0.70", "0.001"),        # average sub-area slope (%) - overwritten per node
     ("STCTL", "1", "1"),
 ]
 
@@ -323,9 +324,12 @@ def write_xprafts_from_engine(
     model_name: str = "DDM_HydroLogic",
     impervious_percent: float = 0.0,
     pervious_mannings_n: float = 0.035,
-    subarea_slope_pct: float = 0.70,
+    subarea_slope_pct: Optional[float] = None,
 ) -> Tuple[str, int, int, float]:
     """Writes a scaffolding XP-RAFTS ``.xpx`` exchange file.
+
+    Each node's SC is the sub-area's equal-area catchment slope as a percentage.
+    Passing ``subarea_slope_pct`` forces that one value on every sub-area instead.
 
     Returns ``(output_path, node_count, link_count, total_area_ha)``.
     """
@@ -351,6 +355,7 @@ def write_xprafts_from_engine(
     areas_ha = {o: max(0.0, _feature_area_m2(features[o]) / 10_000.0) for o in ordered}
     coords = {o: _feature_centroid_xy(features[o]) for o in ordered}
     total_area_ha = sum(areas_ha.values())
+    metrics = subarea_metrics(engine, features, assignments, ordered)
 
     lines: List[str] = []
     lines.append(f"/* XP-RAFTS XPX exchange file - first-pass scaffold from DDM HydroLogic ({model_name}). */")
@@ -385,9 +390,14 @@ def write_xprafts_from_engine(
     # single-instance fields, then the loss reference.
     for outlet in ordered:
         name = name_of[outlet]
+        if subarea_slope_pct is None:
+            # XP-RAFTS holds the sub-area slope as a percentage.
+            slope_pct = float(metrics[int(outlet)]["catchment_slope"]) * 100.0
+        else:
+            slope_pct = float(subarea_slope_pct)
         active = {
             "CA": _f(areas_ha[outlet], 3),
-            "SC": _f(subarea_slope_pct, 2),
+            "SC": _f(slope_pct, 2),
             "PERN": _f(pervious_mannings_n, 3),
         }
         for field, slot0, slot_rest in NODE_SUBAREA_FIELDS:
