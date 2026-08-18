@@ -2,12 +2,17 @@
 
 **From DEM to model-ready catchments in QGIS.**
 
-**v2.1 now features:**
+**v2.2 now features:**
+1. RORB - The .catg file is now inheriting the Slope of Channel instead of a dummy value. 
+2. XP-RAFTS - Slope of Channel was converted from a hardcoded value of 0.70 to catchment slope (%) per subarea.
+3. Squashed extra bugs.
+
+**v2.1:**
 1. Export to URBS (.vec routing file and .csv catchment data file) - Credits: Callan Shonrock
 2. Multiple outlet lines can be drawn for multi-outlet models
 3. Every model export has got companion shapefiles: subareas, centroids, entry points, nodal links and streams
 
-**v2.0 now features:**
+**v2.0:**
 1. Retro compatibility with QGIS 3.22 LTR (tested on v3.22.16)
 2. Faster sub catchment processing and selection
 
@@ -50,7 +55,7 @@ Current version: **2.2** · QGIS 3.22 LTR and 4.x
 ## RORB 6.52 export notes
 
 The RORB export method outputs a .catg file that can be ingested straight into RORB
-Graphical Editor (GE). Most of the parameters have been deliberately left either balnk
+Graphical Editor (GE). Some of the parameters have been deliberately left either balnk
 or with default values.
 
 ## WBNM 2025 export notes
