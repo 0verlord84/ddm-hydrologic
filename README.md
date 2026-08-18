@@ -55,7 +55,7 @@ Current version: **2.2** · QGIS 3.22 LTR and 4.x
 ## RORB 6.52 export notes
 
 The RORB export method outputs a .catg file that can be ingested straight into RORB
-Graphical Editor (GE). Most of the parameters have been deliberately left either balnk
+Graphical Editor (GE). Some of the parameters have been deliberately left either balnk
 or with default values.
 
 ## WBNM 2025 export notes
