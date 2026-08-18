@@ -771,8 +771,8 @@ class D8HydrologyEngine:
         precise clicking. The final GeoPackage is cleaner: consecutive displayed
         segments are dissolved while they share the same Strahler order. Cells with
         Strahler order less than 1 are excluded to reduce noise and computational impacts.
-        A lower-order tributary joining a higher-order stem no longer fragments 
-        the higher-order stem, because the Strahler hierarchy has not changed. 
+        A lower-order tributary joining a higher-order stem no longer fragments
+        the higher-order stem, because the Strahler hierarchy has not changed.
         Reaches are split where the same-order sequence stops, where the downstream order changes,
         or where same-order topology would be ambiguous.
         """

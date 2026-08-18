@@ -311,13 +311,12 @@ def _validate_connected_to_outlet(downstream: Dict[int, int], outlet_node_id: in
 def _write_manual_catg(output_path: str, version: str, nodes: Dict[int, dict], reaches: List[dict], outlet_node_id: int, basin_order: List[int], vector_lines: List[str]):
     node_xy, reach_xy = _normalise_graphical_coordinates(nodes, reaches)
     # RORB GE expects basin node labels in the graphical #NODES block to be
-    # numeric subarea identifiers, not arbitrary strings such as S001.  Using
-    # alphanumeric labels in this field makes RORBwin reject the file while
-    # reading the node block. Keep the name field at the narrow fixed width
-    # used by RORB GE example files; wider fields shift the area/impervious
-    # columns and RORB rejects the first C node record.  The mapping below mirrors the order used in the
-    # Sub Area Data table and the vector/calculation block. Outlet nodes retain
-    # the literal name "outlet".
+    # numeric subarea identifiers, not strings such as S001; alphanumeric labels
+    # make RORBwin reject the file while it reads the node block. Keep the name
+    # field at the narrow fixed width used by the RORB GE example files, because
+    # a wider field shifts the area/impervious columns and RORB then rejects the
+    # first C node record. The numbering below follows the Sub Area Data table
+    # and the vector block. Outlet nodes keep the literal name "outlet".
     basin_label_by_node = {int(node_id): str(idx) for idx, node_id in enumerate(basin_order, start=1)}
     lines: List[str] = []
     lines.append("DDM HydroLogic RORB export")

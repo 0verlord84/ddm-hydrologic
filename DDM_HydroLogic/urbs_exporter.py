@@ -19,7 +19,7 @@ Rainfall-excess is taken to enter at the subarea centroid, so a headwater subare
 routes its own runoff over the centroid-to-outlet half of its main stream, and a
 subarea with upstream inflow routes that inflow to the centroid before adding its
 own rain and routing the combined flow on to the outlet. Where the centroid falls
-outside its own polygon (asymmetry assumed), the whole main stream length is 
+outside its own polygon (asymmetry assumed), the whole main stream length is
 used instead.
 """
 

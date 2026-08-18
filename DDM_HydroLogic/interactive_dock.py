@@ -242,7 +242,8 @@ class DDMHydroLogicDock(QDockWidget):
         self.xprafts_export_btn = QPushButton("Export to XP-RAFTS (.xpx)")
         self.xprafts_export_btn.setToolTip(
             "Creates a first-pass XP-RAFTS .xpx exchange file from current subcatchments, topology and areas. "
-            "Import it in XP-RAFTS (File > Import > XPX). Roughness, slope, routing and storms are left as defaults to edit there."
+            "Import it in XP-RAFTS (File > Import > XPX). Sub-area slopes come from the DEM; "
+            "roughness, routing and storms are left as defaults to edit there."
         )
         export_layout.addWidget(self.xprafts_export_btn)
 
