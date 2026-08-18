@@ -25,9 +25,11 @@ about=Setting up a hydrologic model usually means a few hours of GIS prep work
     some of the most popular TUFLOW xxx_R.shp,
     or URBS .vec routing and .csv catchment files.
 
-    It is important to note that all hydrological/hydraulic choices and parameters, such as 
-    rainfall, losses, Manning's coefficients, subcatchment types, slope, etc..
-    have been deliberately left blank or default values.
+    It is important to note that all hydrological/hydraulic choices and parameters, such as
+    rainfall, losses, Manning's coefficients, subcatchment types, etc..
+    have been deliberately left blank or default values. Anything the DEM can
+    measure - sub-area areas, reach lengths and slopes - is calculated and
+    written into the model files.
 
     Requirements and notes: QGIS 3.22 or newer, with no extra Python packages to
     install (it relies on the numpy and GDAL libraries already bundled with

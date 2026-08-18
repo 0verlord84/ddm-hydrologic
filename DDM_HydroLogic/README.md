@@ -27,7 +27,7 @@ Setting up a hydrologic model usually means a few hours of GIS prep work before 
 - **URBS** `.vec` and `.csv`,
 - or some of the most popular **TUFLOW** xxx_R.shp.
 
-It is important to note that all hydrological/hydraulic choices, such as rainfall, losses, Manning's coefficients, subcatchment types and slope, impervious fractions, etc.. have been deliberately left blank or default values.
+It is important to note that all hydrological/hydraulic choices, such as rainfall, losses, Manning's coefficients, subcatchment types, impervious fractions, etc.. have been deliberately left blank or default values. Anything the DEM can measure - sub-area areas, reach lengths and slopes - is calculated and written into the model files.
 
 Current version: **2.2** · QGIS 3.22 LTR and 4.x
 
@@ -78,7 +78,8 @@ WBNMCHCK/WBNMSORT before relying on any results.
 DDM HydroLogic writes one RAFTS node per subcatchment (named, with easting/northing
 captured from the geometry), one link per drainage connection, and the sub-area area
 in hectares. Each node carries the five RAFTS sub-area slots, with slot 0 holding
-the real sub-area and slots 1–4 as inert placeholders. Manning's coeff, sub-area slope, channel routing, losses and storms are written
+the real sub-area and slots 1–4 as inert placeholders. The sub-area slope (SC) is the equal-area catchment
+slope as a percentage, taken from the DEM. Manning's coeff, channel routing, losses and storms are written
 as defaults — It's highly recommended to review them in XP-RAFTS before running. No design storms are
 selected, so the imported model shows only geometries.
 

@@ -1615,7 +1615,9 @@ class DDMHydroLogicDock(QDockWidget):
                 f"{output_path}\n\n"
                 f"Subareas: {basin_count:,}\n"
                 f"Reaches: {reach_count:,}\n\n"
-                "Review the generated catchment in RORB GE before running hydrology. Subcatchment areas are written to basin/node attributes and fraction impervious defaults to 0.00. " +
+                "Review the generated catchment in RORB GE before running hydrology. Subcatchment areas, "
+                "reach lengths and channel slopes are measured off the DEM, while fraction impervious "
+                "defaults to 0.00. " +
                 ("The drawn outlet line was used as the explicit RORB outlet." if outlet_point is not None else "No drawn outlet line was available, so the outlet was inferred from the terminal drainage point."),
             )
         except HydrologyCancelled:
@@ -1746,7 +1748,8 @@ class DDMHydroLogicDock(QDockWidget):
             self.status_label.setText(
                 f"Exported XP-RAFTS .xpx file: {output_path}. "
                 f"Nodes: {node_count:,}; links: {link_count:,}; total area: {total_area_ha:,.2f} ha. "
-                "Import it in XP-RAFTS (File > Import > XPX). Roughness, slope, routing and storms are defaults to review."
+                "Import it in XP-RAFTS (File > Import > XPX). Sub-area slopes come from the DEM; "
+                "roughness, routing and storms are defaults to review."
             )
             QMessageBox.information(
                 self,
@@ -1757,7 +1760,7 @@ class DDMHydroLogicDock(QDockWidget):
                 f"Links: {link_count:,}\n"
                 f"Total area: {total_area_ha:,.2f} ha\n\n"
                 "Import the file into XP-RAFTS with File > Import > XPX. This is a first-pass scaffold: "
-                "sub-area areas come from QGIS, while Manning's n, slope, channel routing, losses and storms are defaults to review."
+                "sub-area areas and slopes come from QGIS, while Manning's n, channel routing, losses and storms are defaults to review."
             )
         except HydrologyCancelled:
             self.status_label.setText("XP-RAFTS .xpx export aborted.")

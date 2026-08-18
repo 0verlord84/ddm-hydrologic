@@ -16,9 +16,9 @@ That exchange file is the one external tools produce, so this exporter writes an
 
 What QGIS can supply: one RAFTS node per subcatchment
 (named, with easting/northing), one link per drainage connection, and the
-sub-area area in hectares. Everything else (roughness, slope, baseflow, outlet
-structures, storms) is written as a clearly-defined default for the user to
-calibrate in XP-RAFTS.
+sub-area area in hectares and the sub-area slope as a percentage. Everything
+else (roughness, baseflow, outlet structures, storms) is written as a
+clearly-defined default for the user to calibrate in XP-RAFTS.
 
 The XPX grammar (see the XP-RAFTS reference manual, "XPX Command Reference"):
 
@@ -359,7 +359,7 @@ def write_xprafts_from_engine(
 
     lines: List[str] = []
     lines.append(f"/* XP-RAFTS XPX exchange file - first-pass scaffold from DDM HydroLogic ({model_name}). */")
-    lines.append("/* Nodes, links and sub-area areas come from QGIS; roughness, slope, routing and storms are defaults. */")
+    lines.append("/* Nodes, links, sub-area areas and slopes come from QGIS; roughness, routing and storms are defaults. */")
     project = _project_path()
     if project:
         lines.append(f"/* Source QGIS project: {project} */")
