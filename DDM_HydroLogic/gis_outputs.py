@@ -64,6 +64,8 @@ _SUBAREA_FIELDS = [
     ("FracUrban", "double", 15, 5),
     ("FracForest", "double", 15, 5),
     ("Downstream", "integer", 9, 0),
+    ("DDM_ID", "integer", 9, 0),
+    ("Label", "string", 50, 0),
 ]
 
 _LINK_FIELDS = [
@@ -71,6 +73,8 @@ _LINK_FIELDS = [
     ("To_ID", "integer", 9, 0),
     ("ID", "integer", 9, 0),
     ("Model_ID", "string", 20, 0),
+    ("DDM_ID", "integer", 9, 0),
+    ("Label", "string", 50, 0),
 ]
 
 _STREAM_FIELDS = [
@@ -78,12 +82,37 @@ _STREAM_FIELDS = [
     ("Model_ID", "string", 20, 0),
     ("Strahler", "integer", 9, 0),
     ("Length_km", "double", 15, 5),
+    ("DDM_ID", "integer", 9, 0),
+    ("Label", "string", 50, 0),
 ]
 
 
 def _make_field(name: str, kind: str, width: int, precision: int) -> "QgsField":
     qvariant_type, type_name = _FIELD_TYPES[kind]
     return QgsField(name, qvariant_type, type_name, width, precision)
+
+
+def _layer_int(feat, field_name: str, default: int = 0) -> int:
+    """Integer attribute, or the default when the layer has no such field."""
+    try:
+        if field_name not in _field_names(feat):
+            return int(default)
+        return int(feat[field_name])
+    except Exception:
+        log_ignored("gis_outputs._layer_int")
+        return int(default)
+
+
+def _layer_text(feat, field_name: str) -> str:
+    """Text attribute, or an empty string when absent or NULL."""
+    try:
+        if field_name not in _field_names(feat):
+            return ""
+        value = feat[field_name]
+        return "" if value is None else str(value)
+    except Exception:
+        log_ignored("gis_outputs._layer_text")
+        return ""
 
 
 def _numeric_id(label, fallback: int) -> int:
@@ -241,6 +270,12 @@ def write_model_gis_outputs(
     link_rows = []
     stream_rows = []
 
+    # The Breakdown window numbers sub-areas by closeness to the outlet and can
+    # carry a typed note. Both ride along so a row in that table can be found on
+    # the map, without touching the per-model numbering the files above use.
+    ddm_ids = {int(o): _layer_int(features[int(o)], "ddm_id", 0) for o in outlets}
+    notes = {int(o): _layer_text(features[int(o)], "label") for o in outlets}
+
     for outlet in outlets:
         feat = features[int(outlet)]
         info = metrics[int(outlet)]
@@ -257,6 +292,8 @@ def write_model_gis_outputs(
             round(_fraction(feat, "FracUrban", present), 5),
             round(_fraction(feat, "FracForest", present), 5),
             int(number_of[int(ds_outlet)]) if ds_outlet is not None and int(ds_outlet) in number_of else -1,
+            int(ddm_ids[int(outlet)]),
+            notes[int(outlet)],
         ]
 
         geom = feat.geometry()
@@ -286,6 +323,8 @@ def write_model_gis_outputs(
                     int(number_of[int(ds_outlet)]),
                     int(number_of[int(outlet)]),
                     str(model_ids[int(outlet)]),
+                    int(ddm_ids[int(outlet)]),
+                    notes[int(outlet)],
                 ],
             ))
 
@@ -300,6 +339,8 @@ def write_model_gis_outputs(
                     str(model_ids[int(outlet)]),
                     int(strahler),
                     round(float(length_m) / 1000.0, 5),
+                    int(ddm_ids[int(outlet)]),
+                    notes[int(outlet)],
                 ],
             ))
 

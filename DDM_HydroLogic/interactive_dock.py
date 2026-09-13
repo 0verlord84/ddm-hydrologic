@@ -54,6 +54,7 @@ from qgis.core import (
 from qgis.gui import QgsMapToolEmitPoint, QgsRubberBand
 
 from .compat import enum_member, log_ignored, qt_enum
+from .breakdown_dialog import BreakdownDialog
 from .hydrology_engine import D8HydrologyEngine, HydrologyBuildError, HydrologyCancelled
 from .map_tools import DrawOutletLineTool, DrawMaskPolygonTool
 from .rorb_catg_exporter import RorbCatgExportError, write_rorb_catg_from_engine
@@ -61,7 +62,7 @@ from .tuflow_exporter import TUFLOW_LAYERS, TuflowExportError, write_tuflow_from
 from .wbnm_2025_exporter import Wbnm2025ExportError, write_wbnm_2025_from_engine
 from .xprafts_exporter import XpRaftsExportError, write_xprafts_from_engine
 from .urbs_exporter import UrbsExportError, write_urbs_from_engine
-from . import rorb_catg_exporter, urbs_exporter, wbnm_2025_exporter, xprafts_exporter
+from . import urbs_exporter, wbnm_2025_exporter, xprafts_exporter
 from .gis_outputs import write_model_gis_outputs
 
 
@@ -109,6 +110,8 @@ class DDMHydroLogicDock(QDockWidget):
         self.dem_layer_ids = []
         self.abort_requested = False
         self.active_operation = None
+        self._base_tooltips = {}
+        self.breakdown_window = None
 
         try:
             QgsProject.instance().layersWillBeRemoved.connect(self._handle_project_layers_will_be_removed)
@@ -119,6 +122,7 @@ class DDMHydroLogicDock(QDockWidget):
 
         self._build_ui()
         self.refresh_dem_layers()
+        self._refresh_step_gating()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -219,6 +223,13 @@ class DDMHydroLogicDock(QDockWidget):
         process_row.addWidget(self.process_subcatchments_btn, 1)
         process_row.addWidget(self.clear_subcatchments_btn, 1)
         sub_layout.addRow(process_row)
+
+        self.breakdown_btn = QPushButton("Breakdown")
+        self.breakdown_btn.setToolTip(
+            "Lists every processed subcatchment with its areas, contributing upstream area and slope, "
+            "and lets you rebuild them by target total, by area or by Strahler order before committing."
+        )
+        sub_layout.addRow(self.breakdown_btn)
         layout.addWidget(sub_group)
 
         export_group = QGroupBox("Final outputs")
@@ -291,6 +302,8 @@ class DDMHydroLogicDock(QDockWidget):
         self.min_subcatchment_spin.valueChanged.connect(self._subcatchment_parameters_changed)
         self.process_subcatchments_btn.clicked.connect(self.process_subcatchments)
         self.clear_subcatchments_btn.clicked.connect(self.clear_subcatchments)
+        self.breakdown_btn.clicked.connect(self.open_breakdown)
+        self.dem_combo.currentIndexChanged.connect(lambda _idx: self._refresh_step_gating())
         self.export_btn.clicked.connect(self.export_outputs)
         self.rorb_export_btn.clicked.connect(self.export_rorb_catg)
         self.wbnm_export_btn.clicked.connect(self.export_wbnm_2025)
@@ -312,6 +325,7 @@ class DDMHydroLogicDock(QDockWidget):
                 self.dem_layer_ids.append(layer.id())
         if not self.dem_layer_ids:
             self.dem_combo.addItem("No raster DEM layers loaded", "")
+        self._refresh_step_gating()
 
     def selected_dem_layer(self):
         layer_id = self.dem_combo.currentData()
@@ -824,17 +838,98 @@ class DDMHydroLogicDock(QDockWidget):
         self.status_label.setText(message)
         QApplication.processEvents()
 
-    def _set_busy(self, busy):
-        for widget in (
+    def _step_widgets(self):
+        return (
             self.refresh_btn,
+            self.dem_combo,
+            self.min_acc_spin,
             self.mask_btn,
             self.build_btn,
             self.click_btn,
             self.clear_btn,
             self.draw_btn,
             self.clear_outlet_btn,
+            self.min_subcatchment_spin,
             self.process_subcatchments_btn,
             self.clear_subcatchments_btn,
+            self.breakdown_btn,
+            self.export_btn,
+            self.rorb_export_btn,
+            self.wbnm_export_btn,
+            self.xprafts_export_btn,
+            self.tuflow_export_btn,
+            self.urbs_export_btn,
+        )
+
+    def _gate(self, widget, enabled, reason=""):
+        """Enables a control, or disables it and explains what is missing.
+
+        The original tooltip is kept the first time each widget is gated, so the
+        reason can replace it while the step is unavailable and be put back
+        afterwards.
+        """
+        key = id(widget)
+        if key not in self._base_tooltips:
+            self._base_tooltips[key] = widget.toolTip()
+        widget.setEnabled(bool(enabled))
+        widget.setToolTip(self._base_tooltips[key] if enabled else reason)
+
+    def _has_dem_selected(self):
+        return self.selected_dem_layer() is not None
+
+    def _has_flow_paths(self):
+        return self.engine is not None and self._engine_layer_is_available("flow_layer")
+
+    def _has_outlet_lines(self):
+        return bool(self.outlet_line_geoms)
+
+    def _has_subcatchments(self):
+        if not self.current_assignments:
+            return False
+        if not self._engine_layer_is_available("subcatchment_layer"):
+            return False
+        try:
+            return int(self.engine.subcatchment_layer.featureCount()) > 0
+        except Exception:
+            log_ignored("interactive_dock._has_subcatchments")
+            return False
+
+    def _refresh_step_gating(self, force=False):
+        """Greys out every step whose inputs are not on the table yet.
+
+        Each section stays visible so the workflow reads top to bottom, but a
+        button only lights up once the step before it has produced something.
+        """
+        if self.active_operation is not None and not force:
+            return
+        if getattr(self, "breakdown_window", None) is not None:
+            for widget in self._step_widgets():
+                self._gate(widget, False, "Close the Breakdown window first.")
+            return
+        has_dem = self._has_dem_selected()
+        has_flow = self._has_flow_paths()
+        has_subs = self._has_subcatchments()
+        need_dem = "Select a DEM raster in 1. DEM first."
+        need_flow = "Press 4. Compute to create the flow paths first."
+        need_subs = "Press 8. Process subcatchments first."
+
+        self.refresh_btn.setEnabled(True)
+        self.dem_combo.setEnabled(True)
+        self.min_acc_spin.setEnabled(True)
+        self._gate(self.mask_btn, has_dem, need_dem)
+        self._gate(self.build_btn, has_dem, need_dem)
+
+        self._gate(self.click_btn, has_flow, need_flow)
+        self._gate(self.clear_btn, has_flow, need_flow)
+
+        self._gate(self.draw_btn, has_flow, need_flow)
+        self._gate(self.clear_outlet_btn, self._has_outlet_lines(), "No outlet line has been drawn.")
+        self._gate(self.min_subcatchment_spin, has_flow, need_flow)
+        self._gate(self.process_subcatchments_btn, has_flow, need_flow)
+        self._gate(self.clear_subcatchments_btn, has_subs, need_subs)
+        self._gate(self.breakdown_btn, has_subs, need_subs)
+
+        for widget in (
             self.export_btn,
             self.rorb_export_btn,
             self.wbnm_export_btn,
@@ -842,7 +937,14 @@ class DDMHydroLogicDock(QDockWidget):
             self.tuflow_export_btn,
             self.urbs_export_btn,
         ):
-            widget.setEnabled(not busy)
+            self._gate(widget, has_subs, need_subs)
+
+    def _set_busy(self, busy):
+        if busy:
+            for widget in self._step_widgets():
+                widget.setEnabled(False)
+        else:
+            self._refresh_step_gating(force=True)
         self.abort_btn.setEnabled(bool(busy))
         if busy:
             QApplication.setOverrideCursor(qt_enum(Qt, "CursorShape", "WaitCursor"))
@@ -1033,6 +1135,7 @@ class DDMHydroLogicDock(QDockWidget):
             f"{len(self.outlet_cells):,} displayed flow-path cells in total. "
             "Press Process subcatchments to generate the preview/output polygons."
         )
+        self._refresh_step_gating()
 
     def _subcatchment_parameters_changed(self):
         if self.engine is None:
@@ -1049,6 +1152,7 @@ class DDMHydroLogicDock(QDockWidget):
             # the stale Python reference so later actions do not touch a deleted
             # wrapped C++ object.
             setattr(self.engine, "subcatchment_layer", None)
+        self._refresh_step_gating()
 
     def process_subcatchments(self):
         if self.engine is None:
@@ -1104,6 +1208,9 @@ class DDMHydroLogicDock(QDockWidget):
             QgsProject.instance().addMapLayer(layer)
             self.progress.setValue(100)
             self._recalculate_subcatchment_area_fields(layer)
+            # Number the sub-areas outwards from the outlet so the Breakdown window
+            # and the companion shapefiles share one set of QGIS-side ids.
+            self.engine.apply_breakdown_ids(layer, assignments, self.outlet_cells)
             total_area_ha = self._layer_total_area_ha(layer)
             total_cells = sum(len(cells) for cells in assignments.values())
             theoretical_count = int(total_cells // max(1, min_cells))
@@ -1135,6 +1242,29 @@ class DDMHydroLogicDock(QDockWidget):
         finally:
             self.active_operation = None
             self._set_busy(False)
+
+    def open_breakdown(self):
+        """Opens the subcatchment breakdown window on the current output."""
+        if not self._has_subcatchments():
+            QMessageBox.warning(
+                self, "DDM HydroLogic",
+                "Press 8. Process subcatchments before opening the Breakdown window.")
+            return
+        existing = getattr(self, "breakdown_window", None)
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        try:
+            window = BreakdownDialog(self)
+        except Exception as exc:  # pragma: no cover
+            self.breakdown_window = None
+            self._show_dependency_or_runtime_error("Breakdown window", exc)
+            self._refresh_step_gating(force=True)
+            return
+        self.breakdown_window = window
+        self._refresh_step_gating(force=True)
+        window.show()
 
     def _update_outlet_line_overlay(self, points):
         """Adds a thick red outlet/crossing line overlay. Multiple lines accumulate."""
@@ -1583,7 +1713,7 @@ class DDMHydroLogicDock(QDockWidget):
                 if response != enum_member(QMessageBox, "StandardButton", "Yes"):
                     self.status_label.setText("RORB GE .catg export cancelled. Draw an outlet line before exporting to RORB.")
                     return
-            output_path, basin_count, reach_count = write_rorb_catg_from_engine(
+            output_path, basin_count, reach_count, rorb_id_map = write_rorb_catg_from_engine(
                 self.engine,
                 self.current_assignments,
                 path,
@@ -1600,7 +1730,7 @@ class DDMHydroLogicDock(QDockWidget):
                 "RORB",
                 os.path.dirname(output_path),
                 os.path.splitext(os.path.basename(output_path))[0],
-                lambda: rorb_catg_exporter.model_id_map(self.engine, self.current_assignments, outlet_cell),
+                lambda: rorb_id_map,
             )
             self.progress.setValue(100)
             self.status_label.setText(
@@ -2248,6 +2378,7 @@ class DDMHydroLogicDock(QDockWidget):
         gc.collect()
         self.progress.setValue(100)
         self.status_label.setText("Temporary flow-path highlights and light-green catchment overlays cleared. Use 5. Click on flow paths to re-start the selection process.")
+        self._refresh_step_gating()
 
     def clear_outlet_line(self):
         """Clears only the red outlet/crossing line and its captured outlet cells."""
@@ -2261,6 +2392,7 @@ class DDMHydroLogicDock(QDockWidget):
         gc.collect()
         self.progress.setValue(100)
         self.status_label.setText("Outlet line(s) cleared. Draw new outlet line(s) before processing subcatchments, or process the whole DEM when prompted.")
+        self._refresh_step_gating()
 
     def clear_subcatchments(self):
         """Clears only the generated subcatchment layer/assignments."""
@@ -2270,6 +2402,7 @@ class DDMHydroLogicDock(QDockWidget):
         gc.collect()
         self.progress.setValue(100)
         self.status_label.setText("Subcatchments cleared. Adjust 7. Minimum subcatchment size and press 8. Process subcatchments to recompute them.")
+        self._refresh_step_gating()
 
     def _cleanup_after_abort(self, clear_engine=False):
         """Releases unnecessary temporary layers, selections and large Python objects after abort."""
@@ -2296,6 +2429,7 @@ class DDMHydroLogicDock(QDockWidget):
             self.engine = None
 
         gc.collect()
+        self._refresh_step_gating(force=True)
 
     def _qgis_object_is_deleted(self, obj):
         """Returns True when a PyQGIS wrapper points to a deleted C++ object."""
@@ -2391,6 +2525,7 @@ class DDMHydroLogicDock(QDockWidget):
                     self._clear_selection_polygon_overlay()
                     self._clear_outlet_line_overlay()
                     QTimer.singleShot(0, lambda: self._remove_all_plugin_temporary_layers(include_flow=False, include_highlight=True, include_subcatchments=True))
+        QTimer.singleShot(0, self._refresh_step_gating)
 
     def _remove_all_plugin_temporary_layers(self, include_flow=False, include_highlight=True, include_subcatchments=True):
         """Removes stale DDM temporary layers by name, including stale ghost outputs."""

@@ -308,6 +308,15 @@ def _validate_connected_to_outlet(downstream: Dict[int, int], outlet_node_id: in
             cursor = int(downstream[cursor])
 
 
+def _basin_labels(basin_order: List[int]) -> Dict[int, str]:
+    """Sub-area labels keyed by node id, in the order the control vector visits them.
+
+    RORB identifies sub-areas by position: the Sub Area Data table lists areas as
+    A, B, C... in this same order, so the label is the index and nothing else.
+    """
+    return {int(node_id): str(idx) for idx, node_id in enumerate(basin_order, start=1)}
+
+
 def _write_manual_catg(output_path: str, version: str, nodes: Dict[int, dict], reaches: List[dict], outlet_node_id: int, basin_order: List[int], vector_lines: List[str]):
     node_xy, reach_xy = _normalise_graphical_coordinates(nodes, reaches)
     # RORB GE expects basin node labels in the graphical #NODES block to be
@@ -317,7 +326,7 @@ def _write_manual_catg(output_path: str, version: str, nodes: Dict[int, dict], r
     # a wider field shifts the area/impervious columns and RORB then rejects the
     # first C node record. The numbering below follows the Sub Area Data table
     # and the vector block. Outlet nodes keep the literal name "outlet".
-    basin_label_by_node = {int(node_id): str(idx) for idx, node_id in enumerate(basin_order, start=1)}
+    basin_label_by_node = _basin_labels(basin_order)
     lines: List[str] = []
     lines.append("DDM HydroLogic RORB export")
     lines.append(f"C RORB_GE {version}")
@@ -408,7 +417,7 @@ def write_rorb_catg_from_engine(
     outlet_point: Optional[Tuple[float, float]] = None,
     outlet_name: str = "outlet",
     model_outlet_cell: Optional[int] = None,
-) -> Tuple[str, int, int]:
+) -> Tuple[str, int, int, Tuple[Dict[int, str], Dict[int, Optional[int]]]]:
     """Writes a RORBwin/RORB GE .catg file from plugin outputs.
 
     The exported graph is explicitly validated so every basin node has one
@@ -598,20 +607,11 @@ def write_rorb_catg_from_engine(
         output_path += ".catg"
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     _write_manual_catg(output_path, str(rorb_version or "6.52"), nodes, reaches, int(outlet_node_id), basin_order, vector_lines)
-    return output_path, len(ordered_outlets), len(reaches)
 
-
-def model_id_map(engine, assignments, model_outlet_cell=None):
-    """Node numbers as written to the .catg, keyed by outlet cell."""
-    sub_features = _subcatchment_features_by_outlet(engine)
-    selected = {int(k) for k, cells in assignments.items() if cells and int(k) in sub_features}
-    if model_outlet_cell is not None:
-        try:
-            upstream = set(int(c) for c in engine.collect_upstream(int(model_outlet_cell)))
-            upstream.add(int(model_outlet_cell))
-            selected = {o for o in selected if o in upstream}
-        except Exception:
-            log_ignored("rorb_catg_exporter.model_id_map")
-    ordered = sorted(selected, key=lambda cid: (int(engine.accumulation[int(cid)]), int(cid)))
-    return ({int(o): str(i) for i, o in enumerate(ordered, start=1)},
-            downstream_outlet_map(engine, assignments, selected))
+    # The GIS files must carry the labels this .catg actually wrote, so a node in
+    # RORB and a polygon on the map are the same sub-area.
+    labels_by_node = _basin_labels(basin_order)
+    id_map = {int(outlet): labels_by_node[int(node)]
+              for outlet, node in outlet_id_to_node.items() if int(node) in labels_by_node}
+    ds_map = downstream_outlet_map(engine, assignments, set(int(o) for o in ordered_outlets))
+    return output_path, len(ordered_outlets), len(reaches), (id_map, ds_map)

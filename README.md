@@ -2,7 +2,12 @@
 
 **From DEM to model-ready catchments in QGIS.**
 
-**v2.2 now features:**
+**v2.3 now features:**
+1. Breakdown window - a table of every subcatchment (ID, areas, upstream area, slope) with three ways to re-process them: target total, minimum area in pixel/m2/km2/ha, or Strahler confluence order.
+2. Each section of the workflow is greyed out until its inputs are ready, so the steps can only be done in order.
+3. RORB - the companion GIS files now report the same sub-area numbers as the .catg file.
+
+**v2.2:**
 1. RORB - The .catg file is now inheriting the Slope of Channel instead of a dummy value. 
 2. XP-RAFTS - Slope of Channel was converted from a hardcoded value of 0.70 to catchment slope (%) per subarea.
 3. Squashed extra bugs.
@@ -29,7 +34,7 @@ Setting up a hydrologic model usually means a few hours of GIS prep work before 
 
 It is important to note that all hydrological/hydraulic choices, such as rainfall, losses, Manning's coefficients, subcatchment types, impervious fractions, etc.. have been deliberately left blank or default values. Anything the DEM can measure - sub-area areas, reach lengths and slopes - is calculated and written into the model files.
 
-Current version: **2.2** · QGIS 3.22 LTR and 4.x
+Current version: **2.3** · QGIS 3.22 LTR and 4.x
 
 ## Workflow
 
@@ -41,7 +46,8 @@ Current version: **2.2** · QGIS 3.22 LTR and 4.x
 6. (Optional) Draw an outlet line -> Recommended for hydrological modelling exports.
 7. Enter a minimum subcatchment size in m2. (Default = 100,000 m²)
 8. Press **Process subcatchments**. If successful, the plugin reports temporal layers with spatial representation of subcatchments and strahler-ordered flow lines.
-9. Export vectors as a geopackage or straight into your favourite hydrological model and go from there.
+9. (Optional) Press **Breakdown** to review the subcatchments in a table and re-process them by target total, by area or by Strahler order until the breakdown suits the model.
+10. Export vectors as a geopackage or straight into your favourite hydrological model and go from there.
 
 ## Outputs
 
@@ -51,6 +57,40 @@ Current version: **2.2** · QGIS 3.22 LTR and 4.x
 - **Export to XP-RAFTS (.xpx)** writes a first-pass XP-RAFTS exchange file (see notes below).
 - **Export TUFLOW files (.shp)** writes TUFLOW regions shp into a chosen folder. The final catchment will be included in the scaffoldings of the following: 2d_code, 2d_loc, 2d_rf, 2d_po, 2d_mat, 2d_qnl and 2d_soil.
 - **Export to URBS (.vec/.csv)** writes a URBS routing vector file and catchment data file into a chosen folder (see notes below).
+
+## Breakdown window
+
+**Breakdown** opens a table of every processed subcatchment: the QGIS-side ID, the
+area in m2, km2 and ha, a Label you can type into, the total area reporting to the
+subcatchment from upstream, and the equal-area slope of its main flowpath. Click a
+row and that subcatchment is outlined on the canvas. The columns sort on a header
+click and the table can be exported with **Export as CSV**.
+
+The Processing frame at the top re-processes the whole breakdown three ways:
+
+- **Set target total** aims at a number of subcatchments. Confluences force
+  boundaries of their own and the area threshold moves the count in steps, so the
+  exact number is usually out of reach - the nearest achievable breakdown is used
+  and a message says what came out.
+- **Set by area** takes a number and a unit (pixel, m2, km2 or ha) and makes each
+  subcatchment that size or larger, as closely as the flow paths allow.
+- **Set by Strahler order** cuts at stream confluences of the order entered or
+  above. Strahler order only exists on the flow paths the step-2 accumulation
+  threshold displays, so the window shows the highest order available.
+
+**Re-process subcatchments** redraws the breakdown into its own temporary layer and
+leaves the original one on the map, so the two can be compared. **Close** throws
+the re-processing away and puts the original back. **Confirm new subcatchments**
+keeps the new set for the exports and asks whether to keep the original layer too.
+Typed labels belong to the subcatchments on screen, so re-processing clears them
+after asking.
+
+The ID counts outwards from the outlet: 1 is an outlet subcatchment and the number
+grows with distance upstream, each catchment numbered through before the next one
+starts. It is written to the temporary layer and into the companion shapefiles as
+`DDM_ID`, with the Label beside it. It is a GIS handle for finding a subcatchment
+on the map - the model files keep their own numbering, because RORB fixes sub-area
+identity by the order its control vector visits them and cannot be renumbered.
 
 ## RORB 6.52 export notes
 
@@ -125,7 +165,8 @@ included), while `Slope_m_m` follows the main channel only. RORB reach slopes co
 from the channel one and XP-RAFTS `SC` and URBS `CS` come from the catchment one,
 each converted to the units that model expects.
 
-Each layer carries `Model_ID`, the subarea label exactly as it appears in the model
+Each layer also carries `DDM_ID` and `Label` from the Breakdown window, and
+`Model_ID`, the subarea label exactly as it appears in the model
 file (`1`, `2`, `3` for URBS, `S001` for WBNM and XP-RAFTS, the node number for
 RORB), so a node in the `.catg`, `.vec`, `.csv`, `.wbn` or `.xpx` can be found on
 the map and the other way round. The files are loaded into their onw QGIS group

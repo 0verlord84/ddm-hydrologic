@@ -41,6 +41,7 @@ from qgis.core import (
     QgsFillSymbol,
 )
 
+from .catchment_geometry import breakdown_order
 from .compat import enum_member, log_ignored
 
 
@@ -1292,30 +1293,28 @@ class D8HydrologyEngine:
         """"""
         return {key: sorted(cells) for key, cells in self.normalize_overlapping_cell_groups(assignments).items()}
 
-    def build_area_threshold_subcatchments(self, min_cells=1, boundary_outlet_cells=None, include_residual=True):
-        """Subdivides the selected DEM area into all target-size subcatchments.
+    def _ordered_domain_ids(self, domain_set):
+        """Domain cells ordered upstream to downstream.
 
-        The method walks cells from upstream to downstream. Unassigned residual
-        area is accumulated along the D8 graph; once the residual area reaches
-        ``min_cells`` the current cell becomes a subcatchment outlet and that
-        residual contribution is closed off. Cells are then assigned to the
-        first selected outlet they encounter downstream, yielding non-overlapping
-        subcatchments rather than repeated full upstream basins.
+        Upstream cells always have lower accumulation than their downstream
+        receiver in this D8 tree, so sorting on accumulation is a deterministic
+        upstream-to-downstream traversal without a separate topological index.
         """
-        min_cells = max(1, int(min_cells))
-        domain_set = self._domain_cells_for_subcatchments(boundary_outlet_cells)
-        if not domain_set:
-            return {}
-
-        # Upstream cells always have lower accumulation than their downstream
-        # receiver in this D8 tree, so this is a deterministic upstream-to-
-        # downstream traversal without building a separate topological index.
         domain_ids = list(domain_set)
         domain_ids.sort(key=lambda cid: (int(self.accumulation[int(cid)]), int(cid)))
+        return domain_ids
 
+    def _select_area_outlets(self, domain_set, domain_ids, min_cells, include_residual=True, emit=True):
+        """Chooses subcatchment outlets by accumulated residual area.
+
+        Residual area is carried along the D8 graph; once it reaches
+        ``min_cells`` the current cell becomes an outlet and that contribution is
+        closed off. Only the outlet choice happens here, so a search over
+        ``min_cells`` can count the result without paying for cell assignment.
+        """
+        min_cells = max(1, int(min_cells))
         pending_counts = defaultdict(int)
         selected_outlets = []
-        selected_set = set()
 
         total = max(1, len(domain_ids))
         for idx, cell_id in enumerate(domain_ids):
@@ -1327,17 +1326,21 @@ class D8HydrologyEngine:
 
             if count >= min_cells or (include_residual and not has_downstream_in_domain and count > 0):
                 selected_outlets.append(cell_id)
-                selected_set.add(cell_id)
             elif has_downstream_in_domain:
                 pending_counts[down] += count
 
-            if idx and idx % 50000 == 0:
+            if emit and idx and idx % 50000 == 0:
                 self._emit(60 + 10 * idx / total, "Chosing minimum-size subcatchment outlets")
 
-        if not selected_outlets:
+        return selected_outlets
+
+    def _assign_cells_to_outlets(self, domain_set, domain_ids, selected_outlets):
+        """Assigns every domain cell to the first selected outlet downstream of it."""
+        selected_set = {int(o) for o in selected_outlets}
+        if not selected_set:
             return {}
 
-        assignments = {int(outlet): [] for outlet in selected_outlets}
+        assignments = {int(outlet): [] for outlet in selected_set}
         cache = {}
 
         def assign_cell_to_selected_outlet(start_cell):
@@ -1365,6 +1368,7 @@ class D8HydrologyEngine:
             cache[start_cell] = outlet
             return outlet
 
+        total = max(1, len(domain_ids))
         for idx, cell_id in enumerate(domain_ids):
             self._check_cancelled()
             outlet = assign_cell_to_selected_outlet(int(cell_id))
@@ -1373,12 +1377,118 @@ class D8HydrologyEngine:
             if idx and idx % 50000 == 0:
                 self._emit(70 + 10 * idx / total, "Assigning DEM cells to subcatchment outlets")
 
-        # Drop any empty entries left by edge cases, then normalise
-        # overlaps. The area assignment algorithm is designed to be cell-
-        # disjoint already; this extra pass protects stale/outlet-edge cases and
-        # keeps final polygons from overlapping.
+        # Drop any empty entries left by edge cases, then normalise overlaps. The
+        # assignment is designed to be cell-disjoint already; this extra pass
+        # protects stale/outlet-edge cases and keeps final polygons from
+        # overlapping.
         assignments = {outlet: cells for outlet, cells in assignments.items() if cells}
         return self._normalise_assignments_no_overlap(assignments)
+
+    def build_area_threshold_subcatchments(self, min_cells=1, boundary_outlet_cells=None, include_residual=True):
+        """Subdivides the selected DEM area into all target-size subcatchments.
+
+        Outlets are chosen by accumulated residual area, then cells are assigned
+        to the first selected outlet they meet downstream, yielding
+        non-overlapping subcatchments rather than repeated full upstream basins.
+        """
+        domain_set = self._domain_cells_for_subcatchments(boundary_outlet_cells)
+        if not domain_set:
+            return {}
+        domain_ids = self._ordered_domain_ids(domain_set)
+        selected = self._select_area_outlets(domain_set, domain_ids, min_cells, include_residual)
+        if not selected:
+            return {}
+        return self._assign_cells_to_outlets(domain_set, domain_ids, selected)
+
+    def build_target_count_subcatchments(self, target_count, boundary_outlet_cells=None, max_trials=40):
+        """Gets as close as the D8 graph allows to a requested number of subcatchments.
+
+        The count is a step function of the area threshold, and confluences force
+        cuts of their own, so an exact target is usually out of reach. The search
+        narrows the threshold using outlet selection alone, which is cheap, and
+        pays for cell assignment once at the end. Returns the assignments, the
+        count achieved and the threshold in cells that produced it, so the caller
+        can report the difference and write the threshold back.
+        """
+        target_count = max(1, int(target_count))
+        domain_set = self._domain_cells_for_subcatchments(boundary_outlet_cells)
+        if not domain_set:
+            return {}, 0, 1
+        domain_ids = self._ordered_domain_ids(domain_set)
+
+        # A larger threshold can only hold the number of outlets level or reduce
+        # it, so the count is non-increasing and a bisection applies.
+        counts = {}
+
+        def count_for(min_cells):
+            min_cells = max(1, min(int(min_cells), len(domain_ids)))
+            if min_cells not in counts:
+                self._emit(55, "Searching for a threshold that gives %d subcatchments" % target_count)
+                counts[min_cells] = len(self._select_area_outlets(
+                    domain_set, domain_ids, min_cells, include_residual=True, emit=False))
+            return counts[min_cells]
+
+        low, high = 1, max(1, len(domain_ids))
+        best = min(high, max(1, int(round(len(domain_ids) / float(target_count)))))
+        best_count = count_for(best)
+        for _ in range(int(max_trials)):
+            self._check_cancelled()
+            if best_count == target_count or low > high:
+                break
+            mid = (low + high) // 2
+            mid_count = count_for(mid)
+            if abs(mid_count - target_count) < abs(best_count - target_count):
+                best, best_count = mid, mid_count
+            if mid_count > target_count:
+                low = mid + 1
+            else:
+                high = mid - 1
+
+        selected = self._select_area_outlets(domain_set, domain_ids, best, include_residual=True)
+        assignments = self._assign_cells_to_outlets(domain_set, domain_ids, selected)
+        return assignments, len(assignments), int(best)
+
+    def strahler_orders_available(self, boundary_outlet_cells=None):
+        """Strahler orders present on the displayed stream network inside the domain."""
+        domain_set = self._domain_cells_for_subcatchments(boundary_outlet_cells)
+        orders = getattr(self, "display_strahler_by_cell", {}) or {}
+        return sorted({int(v) for c, v in orders.items() if int(c) in domain_set and int(v) >= 1})
+
+    def build_strahler_confluence_subcatchments(self, min_order, boundary_outlet_cells=None):
+        """Cuts subcatchments at stream confluences of a given Strahler order or above.
+
+        A confluence is a displayed stream cell fed by two or more displayed
+        stream cells inside the domain, and the order tested is the confluence
+        cell own order, so an order of 3 cuts where two order-2 streams join to
+        form order 3. Strahler order only exists on the flow paths the
+        accumulation threshold displays, so a coarse threshold leaves fewer
+        orders to cut on. Terminal cells are always outlets, otherwise the
+        downstream-most area would have nowhere to drain.
+        """
+        min_order = max(1, int(min_order))
+        domain_set = self._domain_cells_for_subcatchments(boundary_outlet_cells)
+        if not domain_set:
+            return {}
+        domain_ids = self._ordered_domain_ids(domain_set)
+        orders = getattr(self, "display_strahler_by_cell", {}) or {}
+
+        selected = []
+        for cell_id in domain_ids:
+            self._check_cancelled()
+            cell_id = int(cell_id)
+            down = int(self.downstream[cell_id]) if cell_id >= 0 else -1
+            if down < 0 or down not in domain_set:
+                selected.append(cell_id)
+                continue
+            if int(orders.get(cell_id, 0)) < min_order:
+                continue
+            feeders = [int(u) for u in self.upstream.get(cell_id, []) if int(u) in domain_set and int(u) in orders]
+            if len(feeders) >= 2:
+                selected.append(cell_id)
+
+        if not selected:
+            return {}
+        return self._assign_cells_to_outlets(domain_set, domain_ids, selected)
 
     def create_subcatchment_layer(self, assignments, min_cells=1, dissolve_limit=None):
         """Create a temporary polygon layer with one dissolved outline per subcatchment."""
@@ -1395,6 +1505,8 @@ class D8HydrologyEngine:
             ("area_m2", QVariant.Double),
             ("area_ha", QVariant.Double),
             ("strahler", QVariant.Int),
+            ("ddm_id", QVariant.LongLong),
+            ("label", QVariant.String),
         ):
             field = QgsField(name, variant)
             if name in ("area_m2", "area_ha"):
@@ -1439,6 +1551,8 @@ class D8HydrologyEngine:
                 area_m2,
                 round(float(area_m2 / 10000.0), 2),
                 int(getattr(self, "display_strahler_by_cell", {}).get(int(outlet_id), self.strahler[outlet_id])),
+                0,
+                "",
             ])
             features.append(feat)
             if idx and idx % 25 == 0:
@@ -1454,3 +1568,50 @@ class D8HydrologyEngine:
         layer.setRenderer(QgsSingleSymbolRenderer(symbol))
         self.subcatchment_layer = layer
         return layer
+
+    def apply_breakdown_ids(self, layer, assignments, outlet_cells=None, labels=None):
+        """Writes the Breakdown id and note onto a subcatchment layer.
+
+        The id counts outwards from the model outlet(s): 1 is an outlet sub-area
+        and the number grows with distance upstream. It is a QGIS-side handle for
+        finding a sub-area on the map and in the companion shapefiles. The model
+        files keep their own numbering, because RORB fixes sub-area identity by
+        the order its control vector visits them and cannot be renumbered.
+
+        Returns the ``{outlet cell: id}`` map so a caller can label a table with
+        the same numbers.
+        """
+        order = breakdown_order(self, assignments, outlet_cells)
+        id_of = {int(outlet): idx for idx, outlet in enumerate(order, start=1)}
+        if layer is None:
+            return id_of
+
+        labels = labels or {}
+        fields = layer.fields()
+        id_idx = fields.indexOf("ddm_id")
+        label_idx = fields.indexOf("label")
+        if id_idx < 0 and label_idx < 0:
+            return id_of
+
+        updates = {}
+        for feat in layer.getFeatures():
+            try:
+                outlet = int(feat["outlet_id"])
+            except Exception:
+                log_ignored("hydrology_engine.apply_breakdown_ids")
+                continue
+            attrs = {}
+            if id_idx >= 0:
+                attrs[id_idx] = int(id_of.get(outlet, 0))
+            if label_idx >= 0:
+                attrs[label_idx] = str(labels.get(outlet, "") or "")
+            if attrs:
+                updates[int(feat.id())] = attrs
+
+        if updates:
+            try:
+                layer.dataProvider().changeAttributeValues(updates)
+                layer.triggerRepaint()
+            except Exception:
+                log_ignored("hydrology_engine.apply_breakdown_ids")
+        return id_of

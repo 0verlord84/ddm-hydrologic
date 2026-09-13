@@ -382,3 +382,105 @@ def subarea_metrics(engine, features: Dict[int, object], assignments: Dict[int, 
             "catchment_slope": equal_area_slope(engine, catchment_profile(engine, outlet, member)),
         }
     return metrics
+
+
+def breakdown_order(engine, assignments, outlet_cells=None) -> List[int]:
+    """Subarea outlets ordered by how close they sit to the model outlet(s).
+
+    The catchment outlets come first, in the order their outlet lines were drawn,
+    then each catchment is walked upstream one hop at a time before the next
+    catchment starts, so every catchment keeps a contiguous run of numbers.
+    Subareas the same number of hops from their outlet are ordered by flow
+    accumulation, largest tributary first.
+
+    These numbers are a QGIS-side handle only. Each hydrologic model keeps its
+    own numbering, because RORB in particular fixes sub-area identity by the
+    order its control vector visits them.
+    """
+    selected = {int(o) for o, cells in (assignments or {}).items() if cells}
+    if not selected:
+        return []
+    ds_map = downstream_outlet_map(engine, assignments, selected)
+
+    children: Dict[int, List[int]] = {}
+    for sub, down in ds_map.items():
+        if down is None:
+            continue
+        children.setdefault(int(down), []).append(int(sub))
+
+    def by_accumulation(sub: int):
+        return (-accumulation_of(engine, int(sub)), int(sub))
+
+    terminals = {int(o) for o, down in ds_map.items() if down is None}
+    ordered_terminals: List[int] = []
+    for cell in (outlet_cells or []):
+        cell = int(cell)
+        if cell in terminals and cell not in ordered_terminals:
+            ordered_terminals.append(cell)
+    for term in sorted(terminals, key=by_accumulation):
+        if term not in ordered_terminals:
+            ordered_terminals.append(term)
+
+    order: List[int] = []
+    placed: Set[int] = set()
+    for term in ordered_terminals:
+        level = [term]
+        while level:
+            for sub in level:
+                if sub not in placed:
+                    order.append(sub)
+                    placed.add(sub)
+            nxt: Set[int] = set()
+            for sub in level:
+                nxt.update(children.get(sub, []))
+            level = sorted(nxt - placed, key=by_accumulation)
+    # Anything an odd topology left unreachable still gets a number.
+    for sub in sorted(selected - placed, key=by_accumulation):
+        order.append(sub)
+    return order
+
+
+def upstream_area_ha(areas_ha: Dict[int, float], ds_map: Dict[int, Optional[int]]) -> Dict[int, float]:
+    """Contributing area reporting to each subarea, excluding the subarea itself.
+
+    Counts every subarea upstream, not just the ones draining straight in, so a
+    headwater reads zero.
+    """
+    children: Dict[int, List[int]] = {}
+    for sub, down in ds_map.items():
+        if down is not None:
+            children.setdefault(int(down), []).append(int(sub))
+
+    depth: Dict[int, int] = {}
+    for sub in ds_map:
+        seen: Set[int] = set()
+        cursor, hops = int(sub), 0
+        while True:
+            nxt = ds_map.get(int(cursor))
+            if nxt is None or int(nxt) in seen:
+                break
+            seen.add(int(cursor))
+            hops += 1
+            cursor = int(nxt)
+        depth[int(sub)] = hops
+
+    # Furthest upstream first, so a subarea total is ready before its receiver.
+    totals: Dict[int, float] = {}
+    for sub in sorted(ds_map, key=lambda o: -depth[int(o)]):
+        sub = int(sub)
+        totals[sub] = float(areas_ha.get(sub, 0.0)) + sum(totals.get(int(c), 0.0) for c in children.get(sub, []))
+    return {int(sub): max(0.0, totals[int(sub)] - float(areas_ha.get(int(sub), 0.0))) for sub in ds_map}
+
+
+def channel_slopes(engine, assignments, outlets) -> Dict[int, float]:
+    """Equal-area slope of each subarea main stream, in m/m.
+
+    Lighter than :func:`subarea_metrics`, which also walks the centroid, entry
+    point and whole-catchment profile. The breakdown table only needs the stream.
+    """
+    slopes: Dict[int, float] = {}
+    for outlet in outlets:
+        outlet = int(outlet)
+        member = {int(c) for c in (assignments.get(outlet) or [])}
+        slopes[outlet] = equal_area_slope(engine, main_stem(engine, outlet, member))
+    return slopes
