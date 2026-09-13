@@ -101,7 +101,7 @@ def _feature_impervious_fraction(feat, field_name: str | None = None, default: f
 def _subcatchment_features_by_outlet(engine) -> Dict[int, object]:
     layer = getattr(engine, "subcatchment_layer", None)
     if layer is None or not layer.isValid():
-        raise RorbCatgExportError("No valid subcatchment layer is available. Press Process subcatchments first.")
+        raise RorbCatgExportError("No valid subcatchment layer is available. Process subcatchments in 7. Subcatchments breakdown first.")
     result: Dict[int, object] = {}
     for feat in layer.getFeatures():
         try:
@@ -428,7 +428,7 @@ def write_rorb_catg_from_engine(
     if engine is None:
         raise RorbCatgExportError("No DEM flow graph is available. Press Compute first.")
     if not assignments:
-        raise RorbCatgExportError("No current subcatchment assignments are available. Press Process subcatchments first.")
+        raise RorbCatgExportError("No current subcatchment assignments are available. Process subcatchments in 7. Subcatchments breakdown first.")
 
     sub_features = _subcatchment_features_by_outlet(engine)
     selected_outlets = {int(k) for k, cells in assignments.items() if cells and int(k) in sub_features}

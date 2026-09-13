@@ -7,15 +7,16 @@
 # Foundation, either version 2 of the License, or (at your option) any later
 # version. It is distributed WITHOUT ANY WARRANTY. See the GNU General Public
 # License (the LICENSE file) for more details.
-"""Subcatchment breakdown window.
+"""Subcatchments breakdown window.
 
-Lists every processed subcatchment with its areas, the area reporting to it from
-upstream and its main-stream slope, and rebuilds the set by target total, by
-area or by Strahler order without leaving the window.
+This is where subcatchments are made. The window splits the catchment by number
+of subcatchments, by minimum subcatchment size or by Strahler order, and lists
+every subcatchment with its areas, the area reporting to it from upstream and
+its main-stream slope.
 
-A re-processed set is written to its own temporary layer so the original one
-stays on the map. Close throws the re-processing away and puts the original set
-back; Confirm keeps the new set and asks what to do with the original.
+There is only ever one subcatchment layer. Each Process overwrites it in place.
+Close asks before putting back whatever was there when the window opened, and
+Confirm keeps the latest result.
 
 The ID column counts outwards from the model outlet, so 1 is an outlet sub-area.
 It is a QGIS-side handle only: the hydrologic model files keep their own
@@ -49,15 +50,16 @@ from qgis.PyQt.QtWidgets import (
     QTableWidgetItem,
     QVBoxLayout,
 )
-from qgis.core import QgsCoordinateTransform, QgsGeometry, QgsProject, QgsWkbTypes
+from qgis.core import QgsCoordinateTransform, QgsFeature, QgsGeometry, QgsProject, QgsWkbTypes
 from qgis.gui import QgsRubberBand
 
 from .catchment_geometry import channel_slopes, downstream_outlet_map, upstream_area_ha
 from .compat import enum_member, log_ignored, qt_enum
 from .hydrology_engine import HydrologyCancelled
 
-PREVIEW_LAYER_NAME = "DDM HydroLogic subcatchments - breakdown preview temporary"
-FINAL_LAYER_NAME = "DDM HydroLogic subcatchments - dissolved outlines temporary"
+LAYER_NAME = "DDM HydroLogic subcatchments - dissolved outlines temporary"
+DEFAULT_MIN_AREA_M2 = 100000.0
+DEFAULT_COUNT = 10
 
 # Label, and the square metres one unit covers. A pixel is one DEM cell, so its
 # size comes from the raster rather than a fixed factor.
@@ -67,9 +69,14 @@ AREA_UNITS = (
     ("km²", 1_000_000.0),
     ("ha", 10_000.0),
 )
+M2_UNIT = 1
 
 COLUMNS = ("ID", "Area (m²)", "km²", "ha", "Label", "Upstream area (ha)", "Slope (%)")
 LABEL_COLUMN = 4
+
+MODE_COUNT = "count"
+MODE_AREA = "area"
+MODE_STRAHLER = "strahler"
 
 
 class _NumberItem(QTableWidgetItem):
@@ -86,31 +93,42 @@ class _NumberItem(QTableWidgetItem):
             return super().__lt__(other)
 
 
+def _yes_no(parent, title, text):
+    """Yes/No question that defaults to No, so a stray Enter changes nothing."""
+    yes = enum_member(QMessageBox, "StandardButton", "Yes")
+    no = enum_member(QMessageBox, "StandardButton", "No")
+    return QMessageBox.question(parent, title, text, yes | no, no) == yes
+
+
 class BreakdownDialog(QDialog):
-    """Summary of the processed subcatchments, with the three rebuild modes."""
+    """Makes the subcatchments and summarises them in a table."""
 
     def __init__(self, dock):
         super().__init__(dock)
         self.dock = dock
         self.engine = dock.engine
-        self.setWindowTitle("DDM HydroLogic - subcatchment breakdown")
+        self.setWindowTitle("DDM HydroLogic - subcatchments breakdown")
         self.setModal(False)
         self.resize(980, 640)
 
-        # What Close has to be able to put back.
-        self.original_assignments = {int(k): list(v) for k, v in (dock.current_assignments or {}).items()}
-        self.original_layer = getattr(self.engine, "subcatchment_layer", None)
-        self.original_area_m2 = float(dock.min_subcatchment_spin.value())
+        # Whatever was there when the window opened, so Close can put it back.
+        live = self._live_layer()
+        self.opened_with_layer = live is not None
+        self.opening_assignments = {int(k): list(v) for k, v in (dock.current_assignments or {}).items()}
+        self.opening_rows = self._snapshot(live)
 
-        self.preview_assignments = None
-        self.preview_layer = None
-        self.preview_cells = None
-        self.notes = {}
+        self.dirty = False
+        self.pending_settings = None
+        self.whole_dem_accepted = False
+        self.notes = self._notes_from_layer(live)
         self.highlight_band = None
         self._loading = False
-        self._committing = False
+        self._finished = False
+        self._cleaned_up = False
+        self._unit_index = M2_UNIT
 
         self._build_ui()
+        self._apply_settings(getattr(dock, "breakdown_settings", None))
         self.reload_table()
 
     # ------------------------------------------------------------------
@@ -122,25 +140,25 @@ class BreakdownDialog(QDialog):
         process_group = QGroupBox("Processing")
         process_layout = QVBoxLayout(process_group)
 
-        self.target_radio = QRadioButton("Set target total")
-        self.target_spin = QSpinBox()
-        self.target_spin.setRange(1, 1000000)
-        self.target_spin.setValue(max(1, len(self.original_assignments)))
-        self.target_spin.setToolTip(
+        self.count_radio = QRadioButton("Set n. of subcatchments")
+        self.count_spin = QSpinBox()
+        self.count_spin.setRange(1, 1000000)
+        self.count_spin.setToolTip(
             "Number of subcatchments wanted. Confluences force cuts of their own, so the "
             "count that comes out is the closest the flow graph allows."
         )
-        process_layout.addLayout(self._mode_row(self.target_radio, [self.target_spin]))
+        process_layout.addLayout(self._mode_row(self.count_radio, [self.count_spin]))
 
-        self.area_radio = QRadioButton("Set by area")
+        self.area_radio = QRadioButton("Set by minimum subcatchment size")
         self.area_spin = QDoubleSpinBox()
-        self.area_spin.setRange(0.000001, 1000000000000.0)
-        self.area_spin.setDecimals(6)
-        self.area_spin.setValue(self.original_area_m2 if self.original_area_m2 > 0 else 100000.0)
+        self.area_spin.setDecimals(2)
+        self.area_spin.setRange(0.01, 1000000000000.0)
+        if hasattr(self.area_spin, "setGroupSeparatorShown"):
+            self.area_spin.setGroupSeparatorShown(True)
         self.unit_combo = QComboBox()
         for label, _factor in AREA_UNITS:
             self.unit_combo.addItem(label)
-        self.unit_combo.setCurrentIndex(1)
+        self.unit_combo.setCurrentIndex(M2_UNIT)
         self.area_spin.setToolTip("Each subcatchment comes out at this size or larger, as closely as the flow graph allows.")
         process_layout.addLayout(self._mode_row(self.area_radio, [self.area_spin, self.unit_combo]))
 
@@ -149,7 +167,6 @@ class BreakdownDialog(QDialog):
         self.orders = self._available_orders()
         top_order = max(self.orders) if self.orders else 1
         self.strahler_spin.setRange(1, max(1, top_order))
-        self.strahler_spin.setValue(max(1, min(2, top_order)))
         self.order_hint = QLabel(
             f"highest order on the displayed flow paths: {top_order}" if self.orders
             else "no Strahler orders on the displayed flow paths"
@@ -161,11 +178,11 @@ class BreakdownDialog(QDialog):
         )
         process_layout.addLayout(self._mode_row(self.strahler_radio, [self.strahler_spin, self.order_hint]))
 
-        self.reprocess_btn = QPushButton("Re-process subcatchments")
-        reprocess_row = QHBoxLayout()
-        reprocess_row.addStretch(1)
-        reprocess_row.addWidget(self.reprocess_btn)
-        process_layout.addLayout(reprocess_row)
+        self.process_btn = QPushButton("Process subcatchments")
+        process_row = QHBoxLayout()
+        process_row.addStretch(1)
+        process_row.addWidget(self.process_btn)
+        process_layout.addLayout(process_row)
         layout.addWidget(process_group)
 
         self.table = QTableWidget(0, len(COLUMNS))
@@ -191,7 +208,6 @@ class BreakdownDialog(QDialog):
         button_row.addWidget(self.confirm_btn)
         layout.addLayout(button_row)
 
-        self.area_radio.setChecked(True)
         if not self.orders:
             self.strahler_radio.setEnabled(False)
             self.strahler_radio.setToolTip(
@@ -199,15 +215,15 @@ class BreakdownDialog(QDialog):
                 "threshold in step 2 and compute the flow paths again."
             )
 
-        for radio in (self.target_radio, self.area_radio, self.strahler_radio):
+        for radio in (self.count_radio, self.area_radio, self.strahler_radio):
             radio.toggled.connect(self._sync_mode)
-        self.reprocess_btn.clicked.connect(self.reprocess)
+        self.unit_combo.currentIndexChanged.connect(self._unit_changed)
+        self.process_btn.clicked.connect(self.process)
         self.csv_btn.clicked.connect(self.export_csv)
         self.close_btn.clicked.connect(self.reject)
         self.confirm_btn.clicked.connect(self.confirm)
         self.table.itemSelectionChanged.connect(self._highlight_selected_row)
         self.table.itemChanged.connect(self._note_edited)
-        self._sync_mode()
 
     @staticmethod
     def _mode_row(radio, widgets):
@@ -225,40 +241,177 @@ class BreakdownDialog(QDialog):
             log_ignored("breakdown_dialog._available_orders")
             return []
 
+    # ------------------------------------------------------------------
+    # settings
+    # ------------------------------------------------------------------
+    def _apply_settings(self, settings):
+        """Opens on the settings that made the current subcatchments this session."""
+        settings = settings or {}
+        self.count_spin.setValue(int(settings.get("count", len(self.opening_assignments) or DEFAULT_COUNT)))
+
+        unit = int(settings.get("unit", M2_UNIT))
+        unit = unit if 0 <= unit < len(AREA_UNITS) else M2_UNIT
+        self.unit_combo.blockSignals(True)
+        self.unit_combo.setCurrentIndex(unit)
+        self.unit_combo.blockSignals(False)
+        self._unit_index = unit
+        self.area_spin.setValue(float(settings.get("area", DEFAULT_MIN_AREA_M2)))
+
+        top_order = self.strahler_spin.maximum()
+        self.strahler_spin.setValue(max(1, min(int(settings.get("order", min(2, top_order))), top_order)))
+
+        mode = settings.get("mode", MODE_AREA)
+        if mode == MODE_STRAHLER and not self.orders:
+            mode = MODE_AREA
+        {MODE_COUNT: self.count_radio, MODE_STRAHLER: self.strahler_radio}.get(mode, self.area_radio).setChecked(True)
+        self._sync_mode()
+
+    def _current_settings(self):
+        if self.count_radio.isChecked():
+            mode = MODE_COUNT
+        elif self.strahler_radio.isChecked():
+            mode = MODE_STRAHLER
+        else:
+            mode = MODE_AREA
+        return {
+            "mode": mode,
+            "count": int(self.count_spin.value()),
+            "area": float(self.area_spin.value()),
+            "unit": int(self.unit_combo.currentIndex()),
+            "order": int(self.strahler_spin.value()),
+        }
+
     def _sync_mode(self):
         """Only the active mode accepts input; the other two grey out."""
-        self.target_spin.setEnabled(self.target_radio.isChecked())
+        self.count_spin.setEnabled(self.count_radio.isChecked())
         self.area_spin.setEnabled(self.area_radio.isChecked())
         self.unit_combo.setEnabled(self.area_radio.isChecked())
         self.strahler_spin.setEnabled(self.strahler_radio.isChecked())
 
+    def _square_metres_per_unit(self, index):
+        _label, factor = AREA_UNITS[index]
+        if factor is None:
+            return float(getattr(self.engine, "cell_area", 0.0) or 0.0)
+        return float(factor)
+
+    def _unit_changed(self, index):
+        """Keeps the same area when the unit changes, rather than the same number."""
+        old = self._square_metres_per_unit(self._unit_index)
+        new = self._square_metres_per_unit(index)
+        self._unit_index = int(index)
+        if old > 0 and new > 0:
+            self.area_spin.setValue(float(self.area_spin.value()) * old / new)
+
     def _set_controls_enabled(self, enabled):
-        for widget in (self.target_radio, self.area_radio, self.strahler_radio, self.reprocess_btn,
-                       self.csv_btn, self.close_btn, self.confirm_btn, self.table):
+        for widget in (self.count_radio, self.area_radio, self.strahler_radio, self.process_btn,
+                       self.csv_btn, self.close_btn, self.table):
             widget.setEnabled(bool(enabled))
         if enabled:
             self._sync_mode()
             self.strahler_radio.setEnabled(bool(self.orders))
         else:
-            for widget in (self.target_spin, self.area_spin, self.unit_combo, self.strahler_spin):
+            for widget in (self.count_spin, self.area_spin, self.unit_combo, self.strahler_spin):
                 widget.setEnabled(False)
+        # Nothing to confirm until something has been processed in this visit.
+        self.confirm_btn.setEnabled(bool(enabled) and self.dirty)
+
+    # ------------------------------------------------------------------
+    # the layer
+    # ------------------------------------------------------------------
+    def _live_layer(self):
+        if self.dock._engine_layer_is_available("subcatchment_layer"):
+            return self.engine.subcatchment_layer
+        return None
+
+    @staticmethod
+    def _snapshot(layer):
+        """Geometry and attributes of every feature, enough to rebuild the layer."""
+        if layer is None:
+            return []
+        rows = []
+        for feat in layer.getFeatures():
+            rows.append((QgsGeometry(feat.geometry()), list(feat.attributes())))
+        return rows
+
+    @staticmethod
+    def _notes_from_layer(layer):
+        notes = {}
+        if layer is None or layer.fields().indexOf("label") < 0:
+            return notes
+        for feat in layer.getFeatures():
+            try:
+                text = feat["label"]
+                if text:
+                    notes[int(feat["outlet_id"])] = str(text)
+            except Exception:
+                log_ignored("breakdown_dialog._notes_from_layer")
+        return notes
+
+    @staticmethod
+    def _replace_features(layer, rows):
+        """Swaps every feature in a layer, so the same layer stays on the map."""
+        provider = layer.dataProvider()
+        old_ids = [int(feat.id()) for feat in layer.getFeatures()]
+        if old_ids:
+            provider.deleteFeatures(old_ids)
+        features = []
+        for geom, attrs in rows:
+            feat = QgsFeature(layer.fields())
+            feat.setGeometry(QgsGeometry(geom))
+            feat.setAttributes(list(attrs))
+            features.append(feat)
+        if features:
+            provider.addFeatures(features)
+        layer.updateExtents()
+        layer.triggerRepaint()
+
+    def _install(self, assignments, cells):
+        """Writes a freshly processed set into the one subcatchment layer."""
+        self._clear_highlight()
+        live = self._live_layer()
+        fresh = self.engine.create_subcatchment_layer(assignments, min_cells=max(1, int(cells or 1)))
+        if live is None:
+            fresh.setName(LAYER_NAME)
+            QgsProject.instance().addMapLayer(fresh)
+            live = fresh
+        else:
+            self._replace_features(live, self._snapshot(fresh))
+            self.engine.subcatchment_layer = live
+        self.dock._recalculate_subcatchment_area_fields(live)
+        self.engine.apply_breakdown_ids(live, assignments, self.dock.outlet_cells)
+        self.dock.current_assignments = {int(k): list(v) for k, v in assignments.items()}
+
+    def _revert(self):
+        """Puts back whatever existed when the window opened."""
+        self._clear_highlight()
+        live = self._live_layer()
+        if not self.opened_with_layer:
+            if live is not None:
+                try:
+                    QgsProject.instance().removeMapLayer(live.id())
+                except Exception:
+                    log_ignored("breakdown_dialog._revert")
+            self.engine.subcatchment_layer = None
+            self.dock.current_assignments = {}
+        else:
+            if live is not None:
+                self._replace_features(live, self.opening_rows)
+            self.dock.current_assignments = {int(k): list(v) for k, v in self.opening_assignments.items()}
+        self.dirty = False
 
     # ------------------------------------------------------------------
     # the table
     # ------------------------------------------------------------------
-    def active_assignments(self):
-        return self.preview_assignments if self.preview_assignments is not None else self.original_assignments
-
-    def active_layer(self):
-        return self.preview_layer if self.preview_layer is not None else self.original_layer
-
     def reload_table(self):
-        """Rebuilds every row from the assignments currently in play."""
-        layer = self.active_layer()
-        assignments = self.active_assignments()
+        """Rebuilds every row from the subcatchments currently on the map."""
+        layer = self._live_layer()
+        assignments = self.dock.current_assignments or {}
         if layer is None or not assignments:
             self.table.setRowCount(0)
-            self.summary_label.setText("No subcatchments are available.")
+            self.summary_label.setText(
+                "No subcatchments yet. Choose how to split the catchment and press Process subcatchments."
+            )
+            self._set_controls_enabled(True)
             return
 
         QApplication.setOverrideCursor(qt_enum(Qt, "CursorShape", "WaitCursor"))
@@ -304,15 +457,18 @@ class BreakdownDialog(QDialog):
             self._loading = False
 
             total_ha = sum(areas_ha.values())
-            source = "re-processed" if self.preview_assignments is not None else "current"
+            state = "processed, not yet confirmed" if self.dirty else "current"
             self.summary_label.setText(
-                f"{len(outlets):,} {source} subcatchments, {total_ha:,.2f} ha in total. "
+                f"{len(outlets):,} subcatchments ({state}), {total_ha:,.2f} ha in total. "
                 "Slope is the equal-area slope of each subcatchment main flowpath."
             )
         finally:
+            self._loading = False
             QApplication.restoreOverrideCursor()
+            self._set_controls_enabled(True)
 
     def _note_edited(self, item):
+        """Keeps a typed label and writes it straight onto the layer."""
         if self._loading or item.column() != LABEL_COLUMN:
             return
         id_item = self.table.item(item.row(), 0)
@@ -325,6 +481,18 @@ class BreakdownDialog(QDialog):
         else:
             self.notes.pop(int(outlet), None)
 
+        layer = self._live_layer()
+        feature_id = getattr(id_item, "feature_id", None)
+        if layer is None or feature_id is None:
+            return
+        label_idx = layer.fields().indexOf("label")
+        if label_idx < 0:
+            return
+        try:
+            layer.dataProvider().changeAttributeValues({int(feature_id): {label_idx: text}})
+        except Exception:
+            log_ignored("breakdown_dialog._note_edited")
+
     # ------------------------------------------------------------------
     # canvas highlight
     # ------------------------------------------------------------------
@@ -334,14 +502,11 @@ class BreakdownDialog(QDialog):
         if not items:
             return
         id_item = self.table.item(items[0].row(), 0)
-        outlet = getattr(id_item, "outlet", None)
-        layer = self.active_layer()
-        if outlet is None or layer is None:
+        layer = self._live_layer()
+        feature_id = getattr(id_item, "feature_id", None)
+        if layer is None or feature_id is None:
             return
         try:
-            feature_id = getattr(id_item, "feature_id", None)
-            if feature_id is None:
-                return
             geom = QgsGeometry(layer.getFeature(int(feature_id)).geometry())
             if geom.isNull() or geom.isEmpty():
                 return
@@ -373,55 +538,75 @@ class BreakdownDialog(QDialog):
         self.highlight_band = None
 
     # ------------------------------------------------------------------
-    # re-processing
+    # processing
     # ------------------------------------------------------------------
     def _requested_cells(self):
-        """Area threshold in DEM cells for the Set by area mode."""
-        label, factor = AREA_UNITS[max(0, self.unit_combo.currentIndex())]
+        """Minimum subcatchment size in DEM cells, and how to describe it."""
+        index = max(0, self.unit_combo.currentIndex())
+        label, factor = AREA_UNITS[index]
         value = float(self.area_spin.value())
         if factor is None:
             return max(1, int(round(value))), f"{value:,.0f} {label}"
-        area_m2 = value * float(factor)
-        return self.engine.cells_for_area_m2(area_m2), f"{value:,.4g} {label}"
+        return self.engine.cells_for_area_m2(value * float(factor)), f"{value:,.2f} {label}"
 
-    def reprocess(self):
-        if self.notes:
-            response = QMessageBox.question(
-                self,
-                "Labels will be discarded",
-                "Re-processing replaces every subcatchment, so the labels you have typed cannot "
-                "follow them and will be cleared. Do you want to continue?",
-                enum_member(QMessageBox, "StandardButton", "Yes") | enum_member(QMessageBox, "StandardButton", "No"),
-                enum_member(QMessageBox, "StandardButton", "No"),
-            )
-            if response != enum_member(QMessageBox, "StandardButton", "Yes"):
-                return
+    def process(self):
+        if self.notes and not _yes_no(
+            self,
+            "Labels will be discarded",
+            "Processing replaces every subcatchment, so the labels you have typed cannot "
+            "follow them and will be cleared. Do you want to continue?",
+        ):
+            return
 
         boundary = self.dock.outlet_cells or None
+        if boundary is None and not self.whole_dem_accepted:
+            if not _yes_no(
+                self,
+                "No outlet line drawn",
+                "An outlet line was not drawn. This will process the whole DEM. Do you wish to continue?",
+            ):
+                self.dock.status_label.setText(
+                    "Subcatchment processing cancelled. Draw an outlet line in 6. Draw outlet line(s), "
+                    "then press Process subcatchments again."
+                )
+                return
+            self.whole_dem_accepted = True
+
+        settings = self._current_settings()
         self.dock.abort_requested = False
         self.dock.active_operation = "breakdown"
         self.dock._set_busy(True)
         self._set_controls_enabled(False)
+        finished = False
         warning = ""
         try:
-            if self.target_radio.isChecked():
-                target = int(self.target_spin.value())
+            if settings["mode"] == MODE_COUNT:
+                target = settings["count"]
                 assignments, achieved, cells = self.engine.build_target_count_subcatchments(target, boundary)
                 if achieved != target:
-                    warning = (
-                        f"{achieved:,} subcatchments were created against the {target:,} requested. "
-                        "The count is set by where the flow graph allows a cut: confluences force their own "
-                        "boundaries and the area threshold moves the count in steps, so an exact total is "
-                        "usually out of reach. The nearest achievable breakdown is shown."
-                    )
-                description = f"target total {target:,}"
-            elif self.area_radio.isChecked():
+                    floor = self.engine.terminal_outlet_count(boundary)
+                    if target < floor:
+                        warning = (
+                            f"{achieved:,} subcatchments were created against the {target:,} requested. "
+                            f"The catchment drains out at {floor:,} separate points, and each of those has to be "
+                            f"a subcatchment, so {floor:,} is the fewest possible. An outlet line makes one of "
+                            "these for every flow path it crosses; draw it across a single flow path to allow fewer."
+                        )
+                    else:
+                        warning = (
+                            f"{achieved:,} subcatchments were created against the {target:,} requested. "
+                            "The count is set by where the flow graph allows a cut: confluences force their own "
+                            "boundaries and the area threshold moves the count in steps, so an exact number is "
+                            "usually out of reach. The nearest achievable breakdown is shown."
+                        )
+                description = f"number of subcatchments {target:,}"
+            elif settings["mode"] == MODE_AREA:
                 cells, described = self._requested_cells()
                 assignments = self.engine.build_area_threshold_subcatchments(
                     min_cells=cells, boundary_outlet_cells=boundary, include_residual=True)
-                description = f"minimum size {described}"
+                description = f"minimum subcatchment size {described}"
             else:
-                order = int(self.strahler_spin.value())
+                order = settings["order"]
                 assignments = self.engine.build_strahler_confluence_subcatchments(order, boundary)
                 cells = None
                 description = f"confluences of Strahler order {order} and above"
@@ -430,56 +615,37 @@ class BreakdownDialog(QDialog):
                 QMessageBox.warning(
                     self,
                     "DDM HydroLogic",
-                    "No subcatchments could be created with those settings. Try a smaller minimum size, "
-                    "a larger target total, or a lower Strahler order.",
+                    "No subcatchments could be created with those settings. Try a smaller minimum "
+                    "subcatchment size, a larger number of subcatchments, or a lower Strahler order.",
                 )
                 return
 
-            self._replace_preview_layer(assignments, cells)
+            self._install(assignments, cells)
+            if boundary:
+                self.dock._restrict_flow_layer_to_assignment_domain(assignments)
+            self.dock._clear_flow_selection()
             self.notes = {}
+            self.dirty = True
+            self.pending_settings = settings
             self.reload_table()
+            finished = True
             self.dock.status_label.setText(
-                f"Breakdown re-processed by {description}: {len(assignments):,} subcatchment(s) "
-                "in the breakdown preview layer. Confirm or close the Breakdown window."
+                f"Subcatchments processed by {description}: {len(assignments):,} subcatchment(s). "
+                "Confirm or close the Subcatchments breakdown window."
             )
             if warning:
                 QMessageBox.information(self, "Nearest achievable breakdown", warning)
         except HydrologyCancelled:
-            self.dock.status_label.setText("Breakdown re-processing aborted. The previous subcatchments are unchanged.")
+            self.dock.status_label.setText("Subcatchment processing aborted. The subcatchments on the map are unchanged.")
         except Exception as exc:  # pragma: no cover
-            QMessageBox.critical(self, "DDM HydroLogic", f"Could not re-process the subcatchments:\n\n{exc}")
+            QMessageBox.critical(self, "DDM HydroLogic", f"Could not process the subcatchments:\n\n{exc}")
         finally:
+            # Every dock operation ends by setting the bar; without this it froze
+            # wherever the engine last reported, usually in the high seventies.
+            self.dock.progress.setValue(100 if finished else 0)
             self.dock.active_operation = None
             self.dock._set_busy(False)
             self._set_controls_enabled(True)
-
-    def _replace_preview_layer(self, assignments, cells):
-        """Puts the re-processed set on its own layer, leaving the original alone."""
-        self._clear_highlight()
-        self._remove_layer(self.preview_layer)
-        layer = self.engine.create_subcatchment_layer(assignments, min_cells=max(1, int(cells or 1)))
-        layer.setName(PREVIEW_LAYER_NAME)
-        QgsProject.instance().addMapLayer(layer)
-        self.dock._recalculate_subcatchment_area_fields(layer)
-        self.preview_layer = layer
-        self.preview_assignments = {int(k): list(v) for k, v in assignments.items()}
-        self.preview_cells = int(cells) if cells else None
-        self.dock.current_assignments = self.preview_assignments
-
-    @staticmethod
-    def _remove_layer(layer):
-        if layer is None:
-            return
-        try:
-            layer_id = layer.id()
-        except Exception:
-            log_ignored("breakdown_dialog._remove_layer")
-            return
-        try:
-            if QgsProject.instance().mapLayer(layer_id) is not None:
-                QgsProject.instance().removeMapLayer(layer_id)
-        except Exception:
-            log_ignored("breakdown_dialog._remove_layer")
 
     # ------------------------------------------------------------------
     # leaving the window
@@ -490,7 +656,7 @@ class BreakdownDialog(QDialog):
             return
         path, _filter = QFileDialog.getSaveFileName(
             self,
-            "Export the subcatchment breakdown",
+            "Export the subcatchments breakdown",
             os.path.join(os.path.expanduser("~"), "DDM_HydroLogic_subcatchments.csv"),
             "CSV (*.csv)",
         )
@@ -516,93 +682,68 @@ class BreakdownDialog(QDialog):
         except OSError as exc:
             QMessageBox.critical(self, "DDM HydroLogic", f"Could not write the CSV file:\n\n{exc}")
             return
-        self.dock.status_label.setText(f"Subcatchment breakdown exported: {path}")
+        self.dock.status_label.setText(f"Subcatchments breakdown exported: {path}")
 
     def confirm(self):
-        """Keeps the re-processed set and asks what to do with the original layer."""
-        if self.preview_assignments is None:
-            self.reject()
+        """Keeps the latest processed subcatchments."""
+        if not self.dirty:
             return
-
-        response = QMessageBox.question(
-            self,
-            "Keep the original subcatchments?",
-            "The re-processed subcatchments will be used from here on. Do you want to keep the "
-            "original subcatchment layer on the map as well?",
-            enum_member(QMessageBox, "StandardButton", "Yes") | enum_member(QMessageBox, "StandardButton", "No"),
-            enum_member(QMessageBox, "StandardButton", "No"),
-        )
-        keep_original = response == enum_member(QMessageBox, "StandardButton", "Yes")
-
-        if keep_original:
-            try:
-                if self.original_layer is not None:
-                    self.original_layer.setName(FINAL_LAYER_NAME + " (superseded)")
-            except Exception:
-                log_ignored("breakdown_dialog.confirm")
-        else:
-            self._remove_layer(self.original_layer)
-
-        try:
-            self.preview_layer.setName(FINAL_LAYER_NAME)
-        except Exception:
-            log_ignored("breakdown_dialog.confirm")
-
-        self.engine.subcatchment_layer = self.preview_layer
-        self.dock.current_assignments = self.preview_assignments
-        if self.preview_cells:
-            effective_m2 = float(self.preview_cells) * float(getattr(self.engine, "cell_area", 0.0) or 0.0)
-            if effective_m2 > 0:
-                self.dock.min_subcatchment_spin.blockSignals(True)
-                self.dock.min_subcatchment_spin.setValue(effective_m2)
-                self.dock.min_subcatchment_spin.blockSignals(False)
-        if self.dock.outlet_cells:
-            try:
-                self.dock._restrict_flow_layer_to_assignment_domain(self.preview_assignments)
-            except Exception:
-                log_ignored("breakdown_dialog.confirm")
-
-        count = len(self.preview_assignments)
-        note = "" if self.preview_cells else " The minimum subcatchment size was left as it was, because this mode does not set one."
+        live = self._live_layer()
+        if live is not None:
+            self.engine.apply_breakdown_ids(live, self.dock.current_assignments, self.dock.outlet_cells, self.notes)
+        if self.pending_settings:
+            self.dock.breakdown_settings = dict(self.pending_settings)
+        self.dirty = False
         self.dock.status_label.setText(
-            f"Breakdown confirmed: {count:,} subcatchment(s) are now the current output.{note}"
+            f"Subcatchments confirmed: {len(self.dock.current_assignments):,} subcatchment(s) are now the current output."
         )
-        self._committing = True
-        self.preview_layer = None
+        self._finished = True
         self.accept()
 
-    def _discard(self):
-        """Throws the re-processing away and puts the original set back."""
-        self._clear_highlight()
-        if self.preview_layer is not None:
-            self._remove_layer(self.preview_layer)
-            self.preview_layer = None
-            self.preview_assignments = None
-            self.engine.subcatchment_layer = self.original_layer
-            self.dock.current_assignments = self.original_assignments
+    def _may_leave(self):
+        """Asks before discarding unconfirmed processing; False keeps the window open."""
+        if self._finished:
+            return True
+        if self.dirty:
+            if not _yes_no(
+                self,
+                "Discard the processed subcatchments?",
+                "The subcatchments processed in this window have not been confirmed. Discard them "
+                "and go back to what was there when the window opened?",
+            ):
+                return False
+            self._revert()
             self.dock.status_label.setText(
-                "Breakdown closed. The re-processing was discarded and the original subcatchments are back in use."
+                "Subcatchments breakdown closed. The processing was discarded and the previous state is back."
             )
+        self._finished = True
+        return True
 
     def reject(self):
-        self._discard()
+        if not self._may_leave():
+            return
         super().reject()
 
     def closeEvent(self, event):
-        if not self._committing:
-            self._discard()
-        self._clear_highlight()
-        self.dock.breakdown_window = None
-        try:
-            self.dock._refresh_step_gating(force=True)
-        except Exception:
-            log_ignored("breakdown_dialog.closeEvent")
+        if not self._may_leave():
+            event.ignore()
+            return
+        self._cleanup()
         super().closeEvent(event)
 
     def done(self, result):
-        self.dock.breakdown_window = None
+        self._cleanup()
+        super().done(result)
+
+    def _cleanup(self):
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
+        self._clear_highlight()
+        if getattr(self.dock, "breakdown_window", None) is self:
+            self.dock.breakdown_window = None
         try:
             self.dock._refresh_step_gating(force=True)
         except Exception:
-            log_ignored("breakdown_dialog.done")
-        super().done(result)
+            log_ignored("breakdown_dialog._cleanup")
+        self.deleteLater()

@@ -28,7 +28,6 @@ from qgis.PyQt.QtWidgets import (
     QPushButton,
     QProgressBar,
     QScrollArea,
-    QDoubleSpinBox,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -112,6 +111,9 @@ class DDMHydroLogicDock(QDockWidget):
         self.active_operation = None
         self._base_tooltips = {}
         self.breakdown_window = None
+        # Method and value behind the current subcatchments, so the breakdown
+        # window reopens where it left off. Kept for the session only.
+        self.breakdown_settings = None
 
         try:
             QgsProject.instance().layersWillBeRemoved.connect(self._handle_project_layers_will_be_removed)
@@ -191,7 +193,7 @@ class DDMHydroLogicDock(QDockWidget):
         sub_layout = QFormLayout(sub_group)
         self.draw_subcatchment_hint = QLabel(
             "Left-click to draw a line across a flow path, right-click to finish. "
-            "Select the desired minimum subcatchment size and hit Process subcatchments to visualise them."
+            "Then click on 7. Subcatchments Breakdown to configure the subcatchments."
         )
         self.draw_subcatchment_hint.setWordWrap(True)
         sub_layout.addRow(self.draw_subcatchment_hint)
@@ -203,33 +205,16 @@ class DDMHydroLogicDock(QDockWidget):
         outlet_row.addWidget(self.clear_outlet_btn, 1)
         sub_layout.addRow(outlet_row)
 
-        self.min_subcatchment_spin = QDoubleSpinBox()
-        self.min_subcatchment_spin.setRange(0.0, 1000000000000.0)
-        self.min_subcatchment_spin.setDecimals(0)
-        self.min_subcatchment_spin.setSingleStep(100.0)
-        self.min_subcatchment_spin.setValue(100000.0)
-        self.min_subcatchment_spin.setSuffix(" m²")
-        if hasattr(self.min_subcatchment_spin, "setGroupSeparatorShown"):
-            self.min_subcatchment_spin.setGroupSeparatorShown(True)
-        self.min_subcatchment_spin.setToolTip(
-            "Minimum target subcatchment area in square metres. The plugin converts this to DEM cells, "
-            "then creates as many minimum-size subcatchments as the selected upstream area can hydrologically support. If no outlet line exists, the plugin asks before processing the whole DEM."
-        )
-        sub_layout.addRow("7. Minimum subcatchment size", self.min_subcatchment_spin)
-
-        self.process_subcatchments_btn = QPushButton("8. Process subcatchments")
-        self.clear_subcatchments_btn = QPushButton("Clear subcatchments")
-        process_row = QHBoxLayout()
-        process_row.addWidget(self.process_subcatchments_btn, 1)
-        process_row.addWidget(self.clear_subcatchments_btn, 1)
-        sub_layout.addRow(process_row)
-
-        self.breakdown_btn = QPushButton("Breakdown")
+        self.breakdown_btn = QPushButton("7. Subcatchments breakdown")
         self.breakdown_btn.setToolTip(
-            "Lists every processed subcatchment with its areas, contributing upstream area and slope, "
-            "and lets you rebuild them by target total, by area or by Strahler order before committing."
+            "Splits the catchment by number of subcatchments, by minimum subcatchment size or by "
+            "Strahler order, and lists every subcatchment with its areas, contributing upstream area and slope."
         )
-        sub_layout.addRow(self.breakdown_btn)
+        self.clear_subcatchments_btn = QPushButton("Clear subcatchments")
+        breakdown_row = QHBoxLayout()
+        breakdown_row.addWidget(self.breakdown_btn, 1)
+        breakdown_row.addWidget(self.clear_subcatchments_btn, 1)
+        sub_layout.addRow(breakdown_row)
         layout.addWidget(sub_group)
 
         export_group = QGroupBox("Final outputs")
@@ -299,8 +284,6 @@ class DDMHydroLogicDock(QDockWidget):
         self.click_btn.clicked.connect(self.activate_click_tool)
         self.draw_btn.clicked.connect(self.activate_draw_tool)
         self.clear_outlet_btn.clicked.connect(self.clear_outlet_line)
-        self.min_subcatchment_spin.valueChanged.connect(self._subcatchment_parameters_changed)
-        self.process_subcatchments_btn.clicked.connect(self.process_subcatchments)
         self.clear_subcatchments_btn.clicked.connect(self.clear_subcatchments)
         self.breakdown_btn.clicked.connect(self.open_breakdown)
         self.dem_combo.currentIndexChanged.connect(lambda _idx: self._refresh_step_gating())
@@ -849,8 +832,6 @@ class DDMHydroLogicDock(QDockWidget):
             self.clear_btn,
             self.draw_btn,
             self.clear_outlet_btn,
-            self.min_subcatchment_spin,
-            self.process_subcatchments_btn,
             self.clear_subcatchments_btn,
             self.breakdown_btn,
             self.export_btn,
@@ -904,14 +885,14 @@ class DDMHydroLogicDock(QDockWidget):
             return
         if getattr(self, "breakdown_window", None) is not None:
             for widget in self._step_widgets():
-                self._gate(widget, False, "Close the Breakdown window first.")
+                self._gate(widget, False, "Close the Subcatchments breakdown window first.")
             return
         has_dem = self._has_dem_selected()
         has_flow = self._has_flow_paths()
         has_subs = self._has_subcatchments()
         need_dem = "Select a DEM raster in 1. DEM first."
         need_flow = "Press 4. Compute to create the flow paths first."
-        need_subs = "Press 8. Process subcatchments first."
+        need_subs = "Process subcatchments in 7. Subcatchments breakdown first."
 
         self.refresh_btn.setEnabled(True)
         self.dem_combo.setEnabled(True)
@@ -924,10 +905,8 @@ class DDMHydroLogicDock(QDockWidget):
 
         self._gate(self.draw_btn, has_flow, need_flow)
         self._gate(self.clear_outlet_btn, self._has_outlet_lines(), "No outlet line has been drawn.")
-        self._gate(self.min_subcatchment_spin, has_flow, need_flow)
-        self._gate(self.process_subcatchments_btn, has_flow, need_flow)
+        self._gate(self.breakdown_btn, has_flow, need_flow)
         self._gate(self.clear_subcatchments_btn, has_subs, need_subs)
-        self._gate(self.breakdown_btn, has_subs, need_subs)
 
         for widget in (
             self.export_btn,
@@ -1133,122 +1112,24 @@ class DDMHydroLogicDock(QDockWidget):
         self.status_label.setText(
             f"Outlet line captured. {line_count} outlet line(s) recorded, crossing "
             f"{len(self.outlet_cells):,} displayed flow-path cells in total. "
-            "Press Process subcatchments to generate the preview/output polygons."
+            "Open 7. Subcatchments breakdown to process the subcatchments."
         )
         self._refresh_step_gating()
 
-    def _subcatchment_parameters_changed(self):
-        if self.engine is None:
-            return
-        if self._engine_layer_is_available("subcatchment_layer"):
-            self._remove_layer_if_present("subcatchment_layer")
-            self.current_assignments = {}
-            if self.outlet_cells:
-                self.status_label.setText(
-                    "Minimum subcatchment size changed. Press Process subcatchments to regenerate polygons."
-                )
-        else:
-            # A user may have manually deleted the temporary preview layer. Clear
-            # the stale Python reference so later actions do not touch a deleted
-            # wrapped C++ object.
-            setattr(self.engine, "subcatchment_layer", None)
-        self._refresh_step_gating()
-
-    def process_subcatchments(self):
-        if self.engine is None:
-            QMessageBox.warning(self, "DDM HydroLogic", "Build the temporary flow paths first.")
-            return
-
-        min_area_m2 = float(self.min_subcatchment_spin.value())
-        if min_area_m2 <= 0.0:
-            QMessageBox.warning(
-                self,
-                "Minimum subcatchment size required",
-                "Please input a Minimum subcatchment size greater than 0 m² before processing subcatchments.",
-            )
-            self.status_label.setText("Minimum subcatchment size must be greater than 0 m².")
-            return
-
-        if not self.outlet_cells:
-            response = QMessageBox.question(
-                self,
-                "No outlet line drawn",
-                "An outlet line was not drawn. This will process the whole DEM. Do you wish to continue?",
-                enum_member(QMessageBox, "StandardButton", "Yes") | enum_member(QMessageBox, "StandardButton", "No"),
-                enum_member(QMessageBox, "StandardButton", "No"),
-            )
-            if response != enum_member(QMessageBox, "StandardButton", "Yes"):
-                self.status_label.setText(
-                    "Subcatchment processing cancelled. Draw an outlet/crossing line in section 3, then press Process subcatchments again."
-                )
-                return
-
-        min_cells = self.engine.cells_for_area_m2(min_area_m2)
-        self._remove_all_plugin_temporary_layers(include_flow=False, include_highlight=False, include_subcatchments=True)
-        self._remove_layer_if_present("subcatchment_layer")
-        self.current_assignments = {}
-        self.abort_requested = False
-        self.active_operation = "subcatchments"
-        self._set_busy(True)
-        try:
-            assignments = self.engine.build_area_threshold_subcatchments(
-                min_cells=min_cells,
-                boundary_outlet_cells=self.outlet_cells or None,
-                include_residual=True,
-            )
-            assignments = self.engine._normalise_assignments_no_overlap(assignments)
-            self.current_assignments = assignments
-            if not assignments:
-                scope = "upstream of the drawn outlet/crossing line" if self.outlet_cells else "the DEM"
-                self.status_label.setText(
-                    f"No subcatchments could be created for {scope}. Lower the minimum subcatchment size."
-                )
-                return
-            layer = self.engine.create_subcatchment_layer(assignments, min_cells=min_cells)
-            QgsProject.instance().addMapLayer(layer)
-            self.progress.setValue(100)
-            self._recalculate_subcatchment_area_fields(layer)
-            # Number the sub-areas outwards from the outlet so the Breakdown window
-            # and the companion shapefiles share one set of QGIS-side ids.
-            self.engine.apply_breakdown_ids(layer, assignments, self.outlet_cells)
-            total_area_ha = self._layer_total_area_ha(layer)
-            total_cells = sum(len(cells) for cells in assignments.values())
-            theoretical_count = int(total_cells // max(1, min_cells))
-            scope = "upstream of the drawn outlet/crossing line" if self.outlet_cells else "the whole DEM flow graph"
-            if self.outlet_cells:
-                self._restrict_flow_layer_to_assignment_domain(assignments)
-            self._remove_layer_if_present("highlight_layer")
-            self.selected_highlight_cells = set()
-            self.selected_catchment_groups = {}
-            self.selection_polygon_geom = None
-            self._clear_selection_polygon_overlay()
-            text = (
-                f"Subcatchments processed successfully for {scope}: {len(assignments):,} dissolved outline polygon(s). "
-                f"Total area: {total_area_ha:,.2f} ha. "
-                f"Minimum size: {min_area_m2:,.0f} m² (~{min_cells:,} DEM cells). "
-                f"Theoretical maximum by area alone: {theoretical_count:,}; actual count is constrained by D8 connectivity and confluences."
-            )
-            self.status_label.setText(text)
-            QMessageBox.information(
-                self,
-                "DDM HydroLogic",
-                f"Subcatchment processing successful.\n\nSubcatchments: {len(assignments):,}\nTotal area: {total_area_ha:,.2f} ha",
-            )
-        except HydrologyCancelled:
-            self._cleanup_after_abort(clear_engine=False)
-            self.status_label.setText("Subcatchment processing aborted. Temporary preview memory was released; existing flow paths remain available.")
-        except Exception as exc:  # pragma: no cover
-            QMessageBox.critical(self, "DDM HydroLogic", f"Could not process subcatchments:\n\n{exc}")
-        finally:
-            self.active_operation = None
-            self._set_busy(False)
+    def _clear_flow_selection(self):
+        """Drops the green flow-path selection, which processing supersedes."""
+        self._remove_layer_if_present("highlight_layer")
+        self.selected_highlight_cells = set()
+        self.selected_catchment_groups = {}
+        self.selection_polygon_geom = None
+        self._clear_selection_polygon_overlay()
 
     def open_breakdown(self):
-        """Opens the subcatchment breakdown window on the current output."""
-        if not self._has_subcatchments():
+        """Opens the subcatchments breakdown window, where subcatchments are made."""
+        if not self._has_flow_paths():
             QMessageBox.warning(
                 self, "DDM HydroLogic",
-                "Press 8. Process subcatchments before opening the Breakdown window.")
+                "Press 4. Compute to create the flow paths before opening 7. Subcatchments breakdown.")
             return
         existing = getattr(self, "breakdown_window", None)
         if existing is not None:
@@ -1259,7 +1140,7 @@ class DDMHydroLogicDock(QDockWidget):
             window = BreakdownDialog(self)
         except Exception as exc:  # pragma: no cover
             self.breakdown_window = None
-            self._show_dependency_or_runtime_error("Breakdown window", exc)
+            self._show_dependency_or_runtime_error("Subcatchments breakdown window", exc)
             self._refresh_step_gating(force=True)
             return
         self.breakdown_window = window
@@ -1411,10 +1292,10 @@ class DDMHydroLogicDock(QDockWidget):
         if not self._require_engine_and_layer():
             return
         if not self._engine_layer_is_available("subcatchment_layer"):
-            QMessageBox.warning(self, "DDM HydroLogic", "Press Process subcatchments before exporting.")
+            QMessageBox.warning(self, "DDM HydroLogic", "Process subcatchments in 7. Subcatchments breakdown before exporting.")
             return
         if self.engine.subcatchment_layer.featureCount() == 0:
-            QMessageBox.warning(self, "DDM HydroLogic", "Press Process subcatchments before exporting.")
+            QMessageBox.warning(self, "DDM HydroLogic", "Process subcatchments in 7. Subcatchments breakdown before exporting.")
             return
 
         path, _filter = QFileDialog.getSaveFileName(
@@ -1657,10 +1538,10 @@ class DDMHydroLogicDock(QDockWidget):
             QMessageBox.warning(self, "DDM HydroLogic", "WARNING: multiple outlet lines have been drawn. Only 1 outlet is admissible in RORB. Clear and re-draw one outlet line.")
             return
         if not self._engine_layer_is_available("subcatchment_layer"):
-            QMessageBox.warning(self, "DDM HydroLogic", "Press Process subcatchments before exporting a RORB GE .catg file.")
+            QMessageBox.warning(self, "DDM HydroLogic", "Process subcatchments in 7. Subcatchments breakdown before exporting a RORB GE .catg file.")
             return
         if not self.current_assignments:
-            QMessageBox.warning(self, "DDM HydroLogic", "Current subcatchment assignments are not available. Press Process subcatchments before exporting a RORB GE .catg file.")
+            QMessageBox.warning(self, "DDM HydroLogic", "Current subcatchment assignments are not available. Process subcatchments in 7. Subcatchments breakdown before exporting a RORB GE .catg file.")
             return
 
         try:
@@ -1770,10 +1651,10 @@ class DDMHydroLogicDock(QDockWidget):
             QMessageBox.warning(self, "DDM HydroLogic", "WARNING: multiple outlet lines have been drawn. Only 1 outlet is admissible in WBNM. Clear and re-draw one outlet line.")
             return
         if not self._engine_layer_is_available("subcatchment_layer"):
-            QMessageBox.warning(self, "DDM HydroLogic", "Press Process subcatchments before exporting a WBNM 2025 .wbn file.")
+            QMessageBox.warning(self, "DDM HydroLogic", "Process subcatchments in 7. Subcatchments breakdown before exporting a WBNM 2025 .wbn file.")
             return
         if not self.current_assignments:
-            QMessageBox.warning(self, "DDM HydroLogic", "Current subcatchment assignments are not available. Press Process subcatchments before exporting a WBNM 2025 .wbn file.")
+            QMessageBox.warning(self, "DDM HydroLogic", "Current subcatchment assignments are not available. Process subcatchments in 7. Subcatchments breakdown before exporting a WBNM 2025 .wbn file.")
             return
 
         path, _filter = QFileDialog.getSaveFileName(
@@ -1840,10 +1721,10 @@ class DDMHydroLogicDock(QDockWidget):
             QMessageBox.warning(self, "DDM HydroLogic", "WARNING: multiple outlet lines have been drawn. Only 1 outlet is admissible in XP-RAFTS. Clear and re-draw one outlet line.")
             return
         if not self._engine_layer_is_available("subcatchment_layer"):
-            QMessageBox.warning(self, "DDM HydroLogic", "Press Process subcatchments before exporting an XP-RAFTS .xpx file.")
+            QMessageBox.warning(self, "DDM HydroLogic", "Process subcatchments in 7. Subcatchments breakdown before exporting an XP-RAFTS .xpx file.")
             return
         if not self.current_assignments:
-            QMessageBox.warning(self, "DDM HydroLogic", "Current subcatchment assignments are not available. Press Process subcatchments before exporting an XP-RAFTS .xpx file.")
+            QMessageBox.warning(self, "DDM HydroLogic", "Current subcatchment assignments are not available. Process subcatchments in 7. Subcatchments breakdown before exporting an XP-RAFTS .xpx file.")
             return
 
         path, _filter = QFileDialog.getSaveFileName(
@@ -1909,10 +1790,10 @@ class DDMHydroLogicDock(QDockWidget):
         if not self._require_engine_and_layer():
             return
         if not self._engine_layer_is_available("subcatchment_layer"):
-            QMessageBox.warning(self, "DDM HydroLogic", "Press Process subcatchments before exporting TUFLOW shapefiles.")
+            QMessageBox.warning(self, "DDM HydroLogic", "Process subcatchments in 7. Subcatchments breakdown before exporting TUFLOW shapefiles.")
             return
         if not self.current_assignments:
-            QMessageBox.warning(self, "DDM HydroLogic", "Current subcatchment assignments are not available. Press Process subcatchments before exporting TUFLOW shapefiles.")
+            QMessageBox.warning(self, "DDM HydroLogic", "Current subcatchment assignments are not available. Process subcatchments in 7. Subcatchments breakdown before exporting TUFLOW shapefiles.")
             return
 
         folder = QFileDialog.getExistingDirectory(
@@ -1988,10 +1869,10 @@ class DDMHydroLogicDock(QDockWidget):
         if not self._require_engine_and_layer():
             return
         if not self._engine_layer_is_available("subcatchment_layer"):
-            QMessageBox.warning(self, "DDM HydroLogic", "Press Process subcatchments before exporting URBS files.")
+            QMessageBox.warning(self, "DDM HydroLogic", "Process subcatchments in 7. Subcatchments breakdown before exporting URBS files.")
             return
         if not self.current_assignments:
-            QMessageBox.warning(self, "DDM HydroLogic", "Current subcatchment assignments are not available. Press Process subcatchments before exporting URBS files.")
+            QMessageBox.warning(self, "DDM HydroLogic", "Current subcatchment assignments are not available. Process subcatchments in 7. Subcatchments breakdown before exporting URBS files.")
             return
 
         folder = QFileDialog.getExistingDirectory(
@@ -2401,7 +2282,7 @@ class DDMHydroLogicDock(QDockWidget):
         self.current_assignments = {}
         gc.collect()
         self.progress.setValue(100)
-        self.status_label.setText("Subcatchments cleared. Adjust 7. Minimum subcatchment size and press 8. Process subcatchments to recompute them.")
+        self.status_label.setText("Subcatchments cleared. Open 7. Subcatchments breakdown to process them again.")
         self._refresh_step_gating()
 
     def _cleanup_after_abort(self, clear_engine=False):

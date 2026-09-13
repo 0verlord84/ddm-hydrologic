@@ -1448,6 +1448,22 @@ class D8HydrologyEngine:
         assignments = self._assign_cells_to_outlets(domain_set, domain_ids, selected)
         return assignments, len(assignments), int(best)
 
+    def terminal_outlet_count(self, boundary_outlet_cells=None):
+        """Fewest subcatchments any breakdown can give.
+
+        Every cell that drains straight out of the domain has to be an outlet, so
+        the count can never drop below the number of those. An outlet line that
+        crosses several flow paths makes one per path.
+        """
+        domain_set = self._domain_cells_for_subcatchments(boundary_outlet_cells)
+        count = 0
+        for cell_id in domain_set:
+            cell_id = int(cell_id)
+            down = int(self.downstream[cell_id]) if cell_id >= 0 else -1
+            if down < 0 or down not in domain_set:
+                count += 1
+        return count
+
     def strahler_orders_available(self, boundary_outlet_cells=None):
         """Strahler orders present on the displayed stream network inside the domain."""
         domain_set = self._domain_cells_for_subcatchments(boundary_outlet_cells)

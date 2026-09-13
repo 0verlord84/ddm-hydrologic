@@ -270,7 +270,7 @@ def write_model_gis_outputs(
     link_rows = []
     stream_rows = []
 
-    # The Breakdown window numbers sub-areas by closeness to the outlet and can
+    # The Subcatchments breakdown window numbers sub-areas by closeness to the outlet and can
     # carry a typed note. Both ride along so a row in that table can be found on
     # the map, without touching the per-model numbering the files above use.
     ddm_ids = {int(o): _layer_int(features[int(o)], "ddm_id", 0) for o in outlets}

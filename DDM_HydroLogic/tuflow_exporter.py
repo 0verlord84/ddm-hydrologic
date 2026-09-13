@@ -116,7 +116,7 @@ def _subcatchment_features_by_outlet(engine) -> Dict[int, object]:
     layer = getattr(engine, "subcatchment_layer", None)
     if layer is None or not layer.isValid():
         raise TuflowExportError(
-            "No valid subcatchment layer is available. Press Process subcatchments first."
+            "No valid subcatchment layer is available. Process subcatchments in 7. Subcatchments breakdown first."
         )
     features: Dict[int, object] = {}
     for feat in layer.getFeatures():
@@ -318,7 +318,7 @@ def write_tuflow_from_engine(
         raise TuflowExportError("No DEM flow graph is available. Press Compute first.")
     if not assignments:
         raise TuflowExportError(
-            "No subcatchment assignments are available. Press Process subcatchments first."
+            "No subcatchment assignments are available. Process subcatchments in 7. Subcatchments breakdown first."
         )
 
     features = _subcatchment_features_by_outlet(engine)
