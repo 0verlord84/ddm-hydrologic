@@ -4,7 +4,7 @@ qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
 description=Delineate and create model-ready catchments interactively. Trace D8 flow paths, selects the streams that matter, drop an outlet line, and export straight to GeoPackage, RORB, WBNM, XP-RAFTS, TUFLOW or URBS.
 version=2.3
-changelog=2.3 - Subcatchments are now made in one place, 7. Subcatchments breakdown, which replaces the minimum size box and the Process button on the panel. It splits the catchment by number of subcatchments, by minimum subcatchment size (pixel, m2, km2 or ha) or by Strahler confluence order, lists every subcatchment with its areas, the area reporting to it from upstream and its main-flowpath slope, and exports the table as CSV. Each step of the panel is greyed out until its inputs exist. Sub-areas carry a QGIS-side ID counting outwards from the outlet, written to the temporary layer and the companion shapefiles. The RORB companion shapefiles now report the same sub-area numbers as the .catg file.
+changelog=2.3 - Subcatchments are now made in one place, 7. Subcatchments breakdown, which replaces the minimum size box and the Process button on the panel. It splits the catchment by number of subcatchments, by minimum subcatchment size (pixel, m2, km2 or ha) or by Strahler confluence order, lists every subcatchment with its areas, the area reporting to it from upstream and its main-flowpath slope, and exports the table as CSV. Each step of the panel is greyed out until its inputs exist. Sub-areas carry a QGIS-side ID counting outwards from the outlet, written to the temporary layer and the companion shapefiles. The RORB companion shapefiles now report the same sub-area numbers as the .catg file. Minor bugs squashed.
     2.2 - Catchment and channel slopes are now written into the RORB and XP-RAFTS files instead of placeholder values. The RORB control vector now carries the reach slope on unlined and lined reaches, where the file format expects it.
     2.1 - Export to URBS (.vec/.csv): thanks Callan Shonrock for being the SME for URBS, feedback and testing. Every model export now also writes companion shapefiles (subareas, centroids, sub-area entry points, nodal links and streams) carrying the same sub-area IDs as the model file. Multiple oulet lines can be drawn, with a warning when a multi-outlet model is sent to the single-outlet formats (RORB, WBNM, XP-RAFTS). RORB sub-area nodes are placed on the main stream adjacent to the sub-area centroid. TUFLOW writes one catchment per drawn outlet line, and the companion stream shapefiles are dissolved by Strahler order.
     2.0 - Back compatibility and support for earlier QGIS versions (Long Term Release 3.22) and a much faster interactive overlay.
@@ -16,7 +16,7 @@ about=Setting up a hydrologic model usually means a few hours of GIS prep work
     before the modelling even starts. DDM HydroLogic condenses some of the initial steps
     into one interactive session: it traces D8 flow paths from a DEM, ranks them by 
     Strahler order, and lets you pick the relevant drainage.
-    Draw an outlet line, set a minimum subcatchment size, and DDM HydroLogic cuts 
+    Draw an outlet line, move onto the subcatchment breakdwon window, and DDM HydroLogic cuts 
     the catchment into dissolved subcatchment polygons — then you have choices of exporting as:
 
     GeoPackage of flow paths and subcatchments,
