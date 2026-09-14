@@ -3,9 +3,14 @@
 **From DEM to model-ready catchments in QGIS.**
 
 **v2.3 now features:**
-1. 7. Subcatchments breakdown - one window to make the subcatchments three ways (n. of subcatchments, minimum subcatchment size in pixel/m2/km2/ha, or Strahler confluence order) and review them in a table (ID, areas, upstream area, slope).
+1. Subcatchments breakdown - This function invokes a window to further enhance the subcatchment delineation. Three possible ways: based on n. of subcatchments, minimum subcatchment size in pixel/m2/km2/ha, or Strahler order. A summary table is displayed to select, identify on map and review them.
+  1.1. Ability to reprocess the subcatchment before committing.
+  1.2. "Label" field editable.
+  1.3. Introduced the field "DDM_ID" to match the subcatchments in QGIS and in the hydrological models.
+  1.4. Export table as csv.
 2. Each section of the workflow is greyed out until its inputs are ready, so the steps can only be done in order.
 3. RORB - the companion GIS files now report the same sub-area numbers as the .catg file.
+4. All GIS exports carry both "DDM_ID" and "Label" fields.
 
 **v2.2:**
 1. RORB - The .catg file is now inheriting the Slope of Channel instead of a dummy value. 
