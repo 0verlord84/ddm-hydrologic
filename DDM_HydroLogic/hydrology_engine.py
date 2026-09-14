@@ -346,8 +346,7 @@ class D8HydrologyEngine:
     def _priority_flood_connectivity_graph(self, progress_start=18, progress_span=34, message="Connecting D8 flow paths from low cells upstream"):
         """Builds a boundary-aware priority-flood receiver graph.
 
-        This helper is used by the full fill/connectivity mode and as a safety
-        fallback for the pre-conditioned mode. It starts from every valid
+        Called by _build_downstream_graph_fill_connectivity. It starts from every valid
         raster/mask boundary cell, not merely from the outside row/column of the
         raster. That distinction matters for clipped DEM's with a NoData frame all around its bounds.
         """
@@ -440,8 +439,8 @@ class D8HydrologyEngine:
 
         Uses a boundary-aware priority-flood pass. Valid cells adjacent to NoData
         are considered as outlets as well as valid cells on the outer raster edge.
-        This avoids the old behaviour where a clipped DEM with a NoData border
-        could be forced to drain everything to one global-low cell.
+        A clipped DEM with a NoData border therefore drains to its edges rather
+        than to one global-low cell.
         """
         self._emit(18, "Building hydrologically connected D8 flow graph")
         downstream, filled, outlet_count, _visit_order = self._priority_flood_connectivity_graph(
@@ -772,8 +771,8 @@ class D8HydrologyEngine:
         precise clicking. The final GeoPackage is cleaner: consecutive displayed
         segments are dissolved while they share the same Strahler order. Cells with
         Strahler order less than 1 are excluded to reduce noise and computational impacts.
-        A lower-order tributary joining a higher-order stem no longer fragments
-        the higher-order stem, because the Strahler hierarchy has not changed.
+        A lower-order tributary joining a higher-order stem does not split the
+        higher-order stem, because the Strahler hierarchy has not changed.
         Reaches are split where the same-order sequence stops, where the downstream order changes,
         or where same-order topology would be ambiguous.
         """
@@ -1112,14 +1111,14 @@ class D8HydrologyEngine:
                 return geoms[0]
             return QgsGeometry.unaryUnion(geoms)
         except Exception:
-            # Any GDAL/binding issue degrades gracefully to the exact union.
+            # On any GDAL or binding error, fall back to the per-cell union.
             return self.dissolve_cells_to_geometry(cell_ids)
 
     def create_highlight_layer(self, upstream_cells):
         """Creates or refreshes a yellow line layer showing displayed upstream flow paths.
 
         The DEM graph may contain many more upstream cells than the temporary
-        flow-path layer displays when **Display paths from accumulation** is
+        flow-path layer displays when 2. Display flow paths from flow accumulation is
         greater than 1. Highlights only cells that actually exist as output
         flow-path features, otherwise the click tool draws hidden low-
         accumulation lines back into existence.
@@ -1191,14 +1190,6 @@ class D8HydrologyEngine:
             return 1
         return max(1, int(math.ceil(area_m2 / self.cell_area)))
 
-    def build_subcatchment_assignments(self, outlet_cells, min_cells=1):
-        """Build subcatchment assignments for the current outlet boundary."""
-        return self.build_area_threshold_subcatchments(
-            min_cells=min_cells,
-            boundary_outlet_cells=outlet_cells,
-            include_residual=True,
-        )
-
     def _domain_cells_for_subcatchments(self, boundary_outlet_cells=None):
         """Returns the DEM cells to subdivide into subcatchments.
 
@@ -1255,8 +1246,7 @@ class D8HydrologyEngine:
                 if not cell_set.isdisjoint(parent_cells):
                     # Merge the smaller/child catchment into the parent group.
                     parent_cells.update(cell_set)
-                    # Keep the parent key stable, unless the incoming group is
-                    # actually larger because of an odd stale input ordering.
+                    # Keep the parent key.
                     kept[idx] = (parent_key, parent_cells)
                     merged = True
                     break
@@ -1290,7 +1280,6 @@ class D8HydrologyEngine:
         return {int(key): set(cells) for key, cells in kept}
 
     def _normalise_assignments_no_overlap(self, assignments):
-        """"""
         return {key: sorted(cells) for key, cells in self.normalize_overlapping_cell_groups(assignments).items()}
 
     def _ordered_domain_ids(self, domain_set):
@@ -1403,12 +1392,12 @@ class D8HydrologyEngine:
     def build_target_count_subcatchments(self, target_count, boundary_outlet_cells=None, max_trials=40):
         """Gets as close as the D8 graph allows to a requested number of subcatchments.
 
-        The count is a step function of the area threshold, and confluences force
-        cuts of their own, so an exact target is usually out of reach. The search
-        narrows the threshold using outlet selection alone, which is cheap, and
-        pays for cell assignment once at the end. Returns the assignments, the
-        count achieved and the threshold in cells that produced it, so the caller
-        can report the difference and write the threshold back.
+        The count is a step function of the area threshold, and it can never drop
+        below the number of cells that drain straight out of the domain, so an
+        exact target is often out of reach. The search narrows the threshold using
+        outlet selection alone, which is cheap, and pays for cell assignment once at
+        the end. Returns the assignments, the count achieved and the threshold in
+        cells that produced it, so the caller can report the difference.
         """
         target_count = max(1, int(target_count))
         domain_set = self._domain_cells_for_subcatchments(boundary_outlet_cells)
@@ -1538,9 +1527,8 @@ class D8HydrologyEngine:
             if not cells:
                 continue
 
-            # Always dissolve DEM-cell polygons. Older builds fell back to
-            # collectGeometry for large catchments, which produced a cell-grid
-            # rather than a clean dissolved outline.
+            # Always dissolve DEM-cell polygons: collectGeometry leaves a cell grid,
+            # not an outline.
             geom = self.dissolve_cells_to_geometry(cells)
             if geom.isNull() or geom.isEmpty():
                 continue
@@ -1586,7 +1574,7 @@ class D8HydrologyEngine:
         return layer
 
     def apply_breakdown_ids(self, layer, assignments, outlet_cells=None, labels=None):
-        """Writes the Breakdown id and note onto a subcatchment layer.
+        """Writes ddm_id and label onto a subcatchment layer.
 
         The id counts outwards from the model outlet(s): 1 is an outlet sub-area
         and the number grows with distance upstream. It is a QGIS-side handle for

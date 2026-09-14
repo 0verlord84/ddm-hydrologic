@@ -11,9 +11,10 @@
 
 A TUFLOW 2D model reads most of its spatial inputs from GIS layers whose names
 follow the ``2d_<type>_<scenario>_R`` convention (the ``_R`` marks a region/
-polygon layer). This exporter dissolves all processed subcatchments into one
-topologically valid catchment boundary polygon and writes that single feature
-into some of the most popular region layers a model setup usually starts from:
+polygon layer). This exporter dissolves the processed subcatchments into one
+topologically valid catchment boundary polygon per drawn outlet line (one for the
+whole model if none is drawn) and writes those features into some of the most
+popular region layers a model setup usually starts from:
 
     2d_code   active-area code polygon (Code = 1, the cells TUFLOW computes)
     2d_loc    model location/orientation region

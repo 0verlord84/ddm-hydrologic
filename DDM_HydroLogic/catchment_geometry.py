@@ -11,8 +11,8 @@
 
 The exporters all need the same handful of measurements off the D8 graph: where
 a subarea's main stream runs, where rainfall-excess should enter it, how long
-each channel is and how steep it is. Keeping them here means RORB, URBS and the
-GIS outputs describe the same catchment rather than each deriving its own.
+each channel is and how steep it is. Keeping them here means RORB, URBS, XP-RAFTS
+and the GIS outputs describe the same catchment rather than each deriving its own.
 
 The sub-area entry point follows the RORB convention: a node sits on the
 sub-area's main stream at the point adjacent to the sub-area centroid, which is
@@ -68,8 +68,8 @@ def centroid_of(feat) -> Tuple[float, float, bool]:
     """Subarea centroid as ``(x, y, inside)``.
 
     ``inside`` is False when the true centroid falls outside its own polygon,
-    which happens on horseshoe or ribbon shaped subareas. Callers that need a
-    point guaranteed to sit on the polygon get the point-on-surface instead.
+    which happens on horseshoe or ribbon shaped subareas. The point-on-surface is
+    then returned in its place.
     """
     geom = feat.geometry()
     if geom is None or geom.isNull() or geom.isEmpty():
@@ -387,8 +387,8 @@ def subarea_metrics(engine, features: Dict[int, object], assignments: Dict[int, 
 def breakdown_order(engine, assignments, outlet_cells=None) -> List[int]:
     """Subarea outlets ordered by how close they sit to the model outlet(s).
 
-    The catchment outlets come first, in the order their outlet lines were drawn,
-    then each catchment is walked upstream one hop at a time before the next
+    Catchments are numbered in the order their outlet lines were drawn. Each one
+    starts at its outlet and is walked upstream one hop at a time before the next
     catchment starts, so every catchment keeps a contiguous run of numbers.
     Subareas the same number of hops from their outlet are ordered by flow
     accumulation, largest tributary first.

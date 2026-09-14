@@ -98,7 +98,6 @@ class DDMHydroLogicDock(QDockWidget):
         self.selected_highlight_cells = set()
         self.selected_catchment_groups = {}
         self.selection_polygon_geom = None
-        self.selection_polygon_band = None
         self.selection_polygon_bands = []
         self._catchment_geom_cache = {}
         self.outlet_line_band = None
@@ -694,7 +693,7 @@ class DDMHydroLogicDock(QDockWidget):
                 continue
 
     def _create_nodata_problem_layer(self, checker, info):
-        """Create a red temporary polygon showing NoData cells intersecting the mask."""
+        """Creates a red temporary polygon layer over the given NoData cells."""
         try:
             self._remove_nodata_problem_layer_if_present()
             geoms = []
@@ -713,7 +712,7 @@ class DDMHydroLogicDock(QDockWidget):
             layer.updateFields()
             feat = QgsFeature(layer.fields())
             feat.setGeometry(geom)
-            feat.setAttributes(["NoData cells intersect the mask polygon"])
+            feat.setAttributes(["NoData cells in the analysis area"])
             provider.addFeatures([feat])
             layer.updateExtents()
             symbol = QgsFillSymbol.createSimple({
@@ -726,10 +725,6 @@ class DDMHydroLogicDock(QDockWidget):
             self.canvas.refresh()
         except Exception:
             return
-
-    def _create_mask_nodata_warning_layer(self, checker, info):
-        """Creates the NoData warnig polygon layer."""
-        return self._create_nodata_problem_layer(checker, info)
 
     def build_flow_paths(self):
         dem_layer = self.selected_dem_layer()
@@ -784,7 +779,8 @@ class DDMHydroLogicDock(QDockWidget):
                 )
                 if response != enum_member(QMessageBox, "StandardButton", "Yes"):
                     self.status_label.setText(
-                        "Graph built, but vector layer creation was cancelled. Increase the display accumulation threshold and build again."
+                        "Flow graph built, but the flow-path layer was not created. Increase 2. Display flow paths "
+                        "from flow accumulation and press 4. Compute again."
                     )
                     return
 
@@ -876,10 +872,10 @@ class DDMHydroLogicDock(QDockWidget):
             return False
 
     def _refresh_step_gating(self, force=False):
-        """Greys out every step whose inputs are not on the table yet.
+        """Enables each step only once its inputs exist.
 
-        Each section stays visible so the workflow reads top to bottom, but a
-        button only lights up once the step before it has produced something.
+        Every section stays visible. Everything is disabled while the
+        Subcatchments breakdown window is open.
         """
         if self.active_operation is not None and not force:
             return
@@ -892,7 +888,7 @@ class DDMHydroLogicDock(QDockWidget):
         has_subs = self._has_subcatchments()
         need_dem = "Select a DEM raster in 1. DEM first."
         need_flow = "Press 4. Compute to create the flow paths first."
-        need_subs = "Process subcatchments in 7. Subcatchments breakdown first."
+        need_subs = "Process and confirm subcatchments in 7. Subcatchments breakdown first."
 
         self.refresh_btn.setEnabled(True)
         self.dem_combo.setEnabled(True)
@@ -1069,17 +1065,6 @@ class DDMHydroLogicDock(QDockWidget):
         self._update_selection_polygon_overlays(self.selected_catchment_groups)
         return highlight
 
-    def reset_flow_path_selection(self):
-        if self.engine is None:
-            return
-        self.selected_highlight_cells = set()
-        self.selected_catchment_groups = {}
-        self.selection_polygon_geom = None
-        self._catchment_geom_cache = {}
-        self._remove_layer_if_present("highlight_layer")
-        self._clear_selection_polygon_overlay()
-        self.status_label.setText("Flow path selection reset. Yellow upstream highlights and light-green catchment overlays cleared.")
-
     def activate_draw_tool(self):
         if not self._require_engine_and_layer():
             return
@@ -1168,7 +1153,7 @@ class DDMHydroLogicDock(QDockWidget):
         self.outlet_line_bands.append(band)
 
     def _clear_outlet_line_overlay(self):
-        """Removes and sanitises all red outlet/crossing canvas state (every drawn line)."""
+        """Removes all outlet lines from the canvas and clears the stored outlet geometry."""
         bands = list(getattr(self, "outlet_line_bands", []))
         bands.append(getattr(self, "outlet_line_band", None))
         bands.append(getattr(getattr(self, "draw_tool", None), "rubber_band", None))
@@ -1264,14 +1249,6 @@ class DDMHydroLogicDock(QDockWidget):
             self.selection_polygon_geom = QgsGeometry.unaryUnion(combined_geoms) if len(combined_geoms) > 1 else combined_geoms[0]
 
     def _clear_selection_polygon_overlay(self):
-        if self.selection_polygon_band is not None:
-            try:
-                self.selection_polygon_band.reset(enum_member(QgsWkbTypes, "GeometryType", "PolygonGeometry"))
-                self.selection_polygon_band.hide()
-            except Exception:
-                log_ignored("interactive_dock._clear_selection_polygon_overlay")
-        self.selection_polygon_band = None
-
         for band in list(getattr(self, "selection_polygon_bands", [])):
             try:
                 band.reset(enum_member(QgsWkbTypes, "GeometryType", "PolygonGeometry"))
@@ -1333,7 +1310,7 @@ class DDMHydroLogicDock(QDockWidget):
             self.status_label.setText(f"Exported flow paths and subcatchments to: {path}.{loaded_text}")
             QMessageBox.information(self, "DDM HydroLogic", f"Export complete and loaded into QGIS:\n\n{path}")
         except HydrologyCancelled:
-            self.status_label.setText("Export aborted. Existing in-memory layers were left available; temporary plugin memory was released where safe.")
+            self.status_label.setText("Export aborted. In-memory layers were left as they were.")
         except Exception as exc:  # pragma: no cover
             QMessageBox.critical(self, "DDM HydroLogic", f"Export failed:\n\n{exc}")
         finally:
@@ -1343,7 +1320,7 @@ class DDMHydroLogicDock(QDockWidget):
     def _flow_cells_crossed_by_outlet_geometry(self, geom):
         """Returns displayed flow-path cell ids crossed by an outlet geometry.
 
-        Uses the engine spatial index first, then falls back to a full layer scan.
+        Uses the engine spatial index first, then falls back to a bounding-box query on the flow layer.
         The fallback protects RORB export after in-session feature deletion or
         layer filtering, where the spatial index can be stale.
         """
@@ -1449,10 +1426,8 @@ class DDMHydroLogicDock(QDockWidget):
                         valid_ids = set(int(c) for c in raw_valid_ids)
                     except Exception:
                         valid_ids = set()
-            # Do not use `raw_valid_ids or []` here. In QGIS 4/Python 3.12 the
-            # engine may store valid_ids as a NumPy array, whose truth value is
-            # deliberately ambiguous. That was causing a swallowed exception and
-            # the false "No outlet line has been drawn" warning.
+            # valid_ids can be a NumPy array, so never truth-test it:
+            # `raw_valid_ids or []` raises and would be swallowed below.
             valid_cells = []
             for c in cells:
                 try:
@@ -1587,7 +1562,8 @@ class DDMHydroLogicDock(QDockWidget):
                 response = QMessageBox.question(
                     self,
                     "No RORB outlet line",
-                    "No outlet line has been drawn. RORB requires a connected model outlet. Do you still wish to proceed using an inferred outlet?",
+                    "The outlet line does not cross a flow path, or none has been drawn. RORB requires a connected "
+                    "model outlet. Do you still wish to proceed using an inferred outlet?",
                     enum_member(QMessageBox, "StandardButton", "Yes") | enum_member(QMessageBox, "StandardButton", "No"),
                     enum_member(QMessageBox, "StandardButton", "No"),
                 )
@@ -1786,7 +1762,7 @@ class DDMHydroLogicDock(QDockWidget):
             self._set_busy(False)
 
     def export_tuflow(self):
-        """Exports the merged catchment boundary as TUFLOW region shps."""
+        """Exports TUFLOW region shapefiles, one catchment polygon per drawn outlet line."""
         if not self._require_engine_and_layer():
             return
         if not self._engine_layer_is_available("subcatchment_layer"):
@@ -1946,18 +1922,6 @@ class DDMHydroLogicDock(QDockWidget):
             self.active_operation = None
             self._set_busy(False)
 
-    def _layer_total_area_ha(self, layer):
-        """Returns total polygon area in hectares from actual feature geometries."""
-        total_m2 = 0.0
-        if layer is None or not layer.isValid():
-            return 0.0
-        for feat in layer.getFeatures():
-            self._check_abort_from_dock()
-            geom = feat.geometry()
-            if geom is not None and not geom.isNull() and not geom.isEmpty():
-                total_m2 += float(geom.area())
-        return round(total_m2 / 10000.0, 2)
-
     def _restrict_flow_layer_to_assignment_domain(self, assignments):
         """Keeps only blue Strahler flow paths contributing to the processed outlet domain."""
         if self.engine is None or not self._engine_layer_is_available("flow_layer"):
@@ -2086,10 +2050,9 @@ class DDMHydroLogicDock(QDockWidget):
         return loaded
 
     def _remove_legacy_rorb_group(self):
-        """Removes the old RORB nodes/links group left by earlier versions.
+        """Removes the RORB nodes/links group that versions before 2.1 created.
 
-        The companion shapefiles now cover the node and link geometry, so the
-        temporary layers are no longer created.
+        Node and link geometry is in the companion shapefiles.
         """
         try:
             root = QgsProject.instance().layerTreeRoot()
@@ -2234,9 +2197,8 @@ class DDMHydroLogicDock(QDockWidget):
                 gpkg_layer.saveStyleToDatabase(style_name, "DDM Strahler order blue renderer", True, "", None)
             return True
         except Exception:
-            # Style persistence is useful, but an export should not fail just
-            # because a QGIS build changes the style-save API. The data remains
-            # exported and the in-session layer keeps the renderer.
+            # Style save is best-effort: the data is already written and the
+            # in-session layer keeps its renderer.
             return False
 
     def _check_abort_from_dock(self):
@@ -2246,9 +2208,8 @@ class DDMHydroLogicDock(QDockWidget):
     def clear_temporary_layers(self):
         """Clears only flow-path selection highlights/overlays.
 
-        Outlet lines and subcatchment outputs have their own dedicated clear
-        buttons, so this button now just restarts the interactive flow-path
-        selection state.
+        Outlet lines and subcatchments have their own clear buttons; this one
+        only resets the flow-path selection.
         """
         self._remove_all_plugin_temporary_layers(include_flow=False, include_highlight=True, include_subcatchments=False)
         self._remove_layer_if_present("highlight_layer")

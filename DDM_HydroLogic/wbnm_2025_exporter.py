@@ -348,7 +348,7 @@ def write_wbnm_2025_from_engine(
             "Subareas are listed upstream to downstream; the last one drains to SINK.",
             "Rainfall is a single placeholder storm with zero depth - user to replace it.",
             "Losses, imperviousness and structures are defaults - user to review them.",
-            "Stream routing uses the natural lag factor 1.00 on every segment.",
+            f"Stream routing uses the lag factor {stream_lag_factor:.2f} on every segment.",
             "Check the model in WBNM (WBNMCHCK/WBNMSORT) before using any results.",
         ],
         "#####END_PREAMBLE_BLOCK############|###########|###########|###########|",

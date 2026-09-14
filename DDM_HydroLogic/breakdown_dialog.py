@@ -144,8 +144,8 @@ class BreakdownDialog(QDialog):
         self.count_spin = QSpinBox()
         self.count_spin.setRange(1, 1000000)
         self.count_spin.setToolTip(
-            "Number of subcatchments wanted. Confluences force cuts of their own, so the "
-            "count that comes out is the closest the flow graph allows."
+            "Number of subcatchments wanted. The count moves in steps as the size threshold "
+            "changes, so the closest reachable count is used."
         )
         process_layout.addLayout(self._mode_row(self.count_radio, [self.count_spin]))
 
@@ -159,7 +159,10 @@ class BreakdownDialog(QDialog):
         for label, _factor in AREA_UNITS:
             self.unit_combo.addItem(label)
         self.unit_combo.setCurrentIndex(M2_UNIT)
-        self.area_spin.setToolTip("Each subcatchment comes out at this size or larger, as closely as the flow graph allows.")
+        self.area_spin.setToolTip(
+            "Smallest subcatchment size. Subcatchments at a catchment outlet take the area left over "
+            "and can be smaller."
+        )
         process_layout.addLayout(self._mode_row(self.area_radio, [self.area_spin, self.unit_combo]))
 
         self.strahler_radio = QRadioButton("Set by Strahler order")
@@ -595,8 +598,7 @@ class BreakdownDialog(QDialog):
                     else:
                         warning = (
                             f"{achieved:,} subcatchments were created against the {target:,} requested. "
-                            "The count is set by where the flow graph allows a cut: confluences force their own "
-                            "boundaries and the area threshold moves the count in steps, so an exact number is "
+                            "The count moves in steps as the size threshold changes, so an exact number is "
                             "usually out of reach. The nearest achievable breakdown is shown."
                         )
                 description = f"number of subcatchments {target:,}"

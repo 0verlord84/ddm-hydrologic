@@ -67,7 +67,7 @@ Current version: **2.3** · QGIS 3.22 LTR and 4.x
 frame at the top splits the catchment three ways:
 
 - **Set n. of subcatchments** aims at a number of subcatchments. The count moves in
-  steps as the area threshold changes and confluences force boundaries of their own,
+  steps as the area threshold changes,
   so the exact number is often out of reach - the nearest achievable breakdown is
   used and a message says what came out. The catchment can never have fewer
   subcatchments than the places it drains out of, and an outlet line makes one of
@@ -155,7 +155,7 @@ parameters are left as defaults to complete in URBS.
 
 ## Companion GIS files
 
-Every model export also writes five shapefiles into a folder of your choosing, in
+The RORB, WBNM, XP-RAFTS and URBS exports also write five shapefiles into a folder of your choosing, in
 the CRS of the DEM and named after the model file:
 
 | File | Holds |

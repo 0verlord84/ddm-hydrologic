@@ -268,7 +268,7 @@ def _route_vector_lines(upstream: Dict[int, List[int]], downstream: Dict[int, in
             code = 2
         reach = reach_by_us.get(int(node_id))
         if reach is None:
-            raise RorbCatgExportError("A RORB basin node is missing its downstream reach. Recompute subcatchments and export again.")
+            raise RorbCatgExportError("A RORB basin node is missing its downstream reach. Process subcatchments again in 7. Subcatchments breakdown, then export again.")
         length_km = max(0.0, float(reach["length_m"]) / 1000.0)
         # Natural and drowned reaches skip the slope item; unlined and lined
         # reaches carry it between the length and the -99 terminator.
@@ -298,7 +298,7 @@ def _validate_connected_to_outlet(downstream: Dict[int, int], outlet_node_id: in
         cursor = int(node_id)
         while cursor != int(outlet_node_id):
             if cursor in seen:
-                raise RorbCatgExportError("A loop was detected in the RORB export network. Recompute subcatchments and redraw the outlet line.")
+                raise RorbCatgExportError("A loop was detected in the RORB export network. Redraw the outlet line, then process subcatchments again in 7. Subcatchments breakdown.")
             seen.add(cursor)
             if cursor not in downstream:
                 raise RorbCatgExportError(
@@ -373,8 +373,6 @@ def _write_manual_catg(output_path: str, version: str, nodes: Dict[int, dict], r
         rid = int(reach["id"])
         gx, gy = reach_xy[int(rid)]
         # RORB GE example files leave the graphical reach name field blank.
-        # Alphanumeric reach labels are unnecessary and can make older parsers
-        # brittle, so keep the field empty and identify reaches by number.
         name = ""
         us = int(reach["us_node"])
         ds = int(reach["ds_node"])
@@ -601,7 +599,7 @@ def write_rorb_catg_from_engine(
     reach_by_us = {int(r["us_node"]): r for r in reaches}
     vector_lines, basin_order = _route_vector_lines(upstream, downstream, reach_by_us, int(outlet_node_id))
     if len(basin_order) != len(ordered_outlets):
-        raise RorbCatgExportError("The RORB calculation order did not include every subcatchment. Recompute subcatchments and export again.")
+        raise RorbCatgExportError("The RORB calculation order did not include every subcatchment. Process subcatchments again in 7. Subcatchments breakdown, then export again.")
 
     if not output_path.lower().endswith(".catg"):
         output_path += ".catg"

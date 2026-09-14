@@ -18,9 +18,9 @@ slope. Both are built from the subcatchment topology.
 Rainfall-excess is taken to enter at the subarea centroid, so a headwater subarea
 routes its own runoff over the centroid-to-outlet half of its main stream, and a
 subarea with upstream inflow routes that inflow to the centroid before adding its
-own rain and routing the combined flow on to the outlet. Where the centroid falls
-outside its own polygon (asymmetry assumed), the whole main stream length is
-used instead.
+own rain and routing the combined flow on to the outlet. Where a headwater's
+centroid falls outside its own polygon (asymmetry assumed), the whole main stream
+length is used instead.
 """
 
 from __future__ import annotations

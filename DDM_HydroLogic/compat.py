@@ -20,10 +20,8 @@ _logged = {}
 def log_ignored(context=""):
     """Record a non-fatal error in the QGIS log and carry on.
 
-    The plugin keeps working when a single QGIS call fails, so that one
-    unsupported call on one build does not stop a whole export. Sending the
-    detail to the log panel means those failures can still be traced instead of
-    disappearing silently.
+    For calls that can fail on some QGIS builds without stopping a whole export.
+    The detail goes to the log panel so the failure can still be traced.
     """
     seen = _logged.get(context, 0)
     if seen >= _LOG_LIMIT:

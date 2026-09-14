@@ -17,8 +17,8 @@ That exchange file is the one external tools produce, so this exporter writes an
 What QGIS can supply: one RAFTS node per subcatchment
 (named, with easting/northing), one link per drainage connection, and the
 sub-area area in hectares and the sub-area slope as a percentage. Everything
-else (roughness, baseflow, outlet structures, storms) is written as a
-clearly-defined default for the user to calibrate in XP-RAFTS.
+else (roughness, baseflow, outlet structures, storms) is written as a default
+for the user to calibrate in XP-RAFTS; no storm is selected.
 
 The XPX grammar (see the XP-RAFTS reference manual, "XPX Command Reference"):
 
@@ -55,8 +55,8 @@ LOSS_IL = 10.0
 LOSS_CL = 2.5
 
 # Per-node fields that exist once for each of the five sub-area slots, written
-# as (field, value_for_slot_0, value_for_slots_1_to_4). CA and SC are filled in
-# per node from the GIS geometry; the values here are their slot defaults.
+# as (field, value_for_slot_0, value_for_slots_1_to_4). CA, SC and PERN are set
+# per node; the values here are their slot defaults.
 NODE_SUBAREA_FIELDS = [
     ("ASUBCTL", "user", "user"),    # sub-area control: user-defined hydrograph
     ("BCTL", "calc", "0"),          # basin routing: calculated for the active slot
