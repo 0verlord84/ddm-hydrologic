@@ -437,7 +437,7 @@ def write_rorb_catg_from_engine(
     upstream_to_model_outlet = None
     if model_outlet_cell is not None:
         try:
-            upstream_to_model_outlet = set(int(c) for c in engine.collect_upstream(int(model_outlet_cell)))
+            upstream_to_model_outlet = set(engine.collect_upstream(int(model_outlet_cell)))
             upstream_to_model_outlet.add(int(model_outlet_cell))
         except Exception:
             upstream_to_model_outlet = None

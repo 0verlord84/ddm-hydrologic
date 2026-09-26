@@ -105,6 +105,11 @@ class DDMHydroLogicDock(QDockWidget):
         self.outlet_line_layer_geom = None
         self.outlet_line_geoms = []
         self.outlet_line_bands = []
+        # Breaklines force a subcatchment boundary where they cross a flow path.
+        # They stay until cleared, across processing runs and Compute.
+        self.breakline_geoms = []
+        self.breakline_bands = []
+        self.breakline_tool = None
         self.dem_layer_ids = []
         self.abort_requested = False
         self.active_operation = None
@@ -116,6 +121,7 @@ class DDMHydroLogicDock(QDockWidget):
 
         try:
             QgsProject.instance().layersWillBeRemoved.connect(self._handle_project_layers_will_be_removed)
+            QgsProject.instance().cleared.connect(self._handle_project_cleared)
         except Exception:
             # Signal names/signatures can shift across QGIS/PyQt builds.
             # The layer validity checks below still protect the workflow.
@@ -973,7 +979,7 @@ class DDMHydroLogicDock(QDockWidget):
                     "and their displayed upstream flow-path highlights."
                 )
             else:
-                upstream_cells = set(int(c) for c in self.engine.collect_upstream(cell_id))
+                upstream_cells = set(self.engine.collect_upstream(cell_id))
                 self.selected_catchment_groups[int(cell_id)] = upstream_cells
                 before_groups = len(self.selected_catchment_groups)
                 self.selected_catchment_groups = self.engine.normalize_overlapping_cell_groups(self.selected_catchment_groups)
@@ -1151,6 +1157,164 @@ class DDMHydroLogicDock(QDockWidget):
         band.show()
         self.outlet_line_band = band
         self.outlet_line_bands.append(band)
+
+    BREAKLINE_COLOUR = (255, 140, 0, 235)
+
+    def start_breakline_tool(self, on_added=None, on_stopped=None):
+        """Lets the user draw breaklines on the canvas until stopped.
+
+        ``on_stopped`` runs when drawing ends from the canvas side: Escape, or
+        another map tool taking over.
+        """
+        self.stop_breakline_tool()
+        tool = DrawOutletLineTool(self.canvas, color=QColor(*self.BREAKLINE_COLOUR))
+        tool.lineFinished.connect(lambda points: self._handle_breakline(points, on_added))
+        tool.cancelled.connect(lambda: self._breakline_tool_ended(tool, on_stopped))
+        tool.deactivated.connect(lambda: self._breakline_tool_ended(tool, on_stopped))
+        self.breakline_tool = tool
+        self.canvas.setMapTool(tool)
+
+    def _breakline_tool_ended(self, tool, on_stopped):
+        if self.breakline_tool is not tool:
+            return
+        self.stop_breakline_tool()
+        self.status_label.setText(
+            f"Breakline drawing stopped. {len(self.breakline_geoms)} breakline(s) will be applied at the next "
+            "Process subcatchments."
+        )
+        if on_stopped is not None:
+            try:
+                on_stopped()
+            except RuntimeError:
+                # The window was closed while the tool was still set.
+                log_ignored("interactive_dock._breakline_tool_ended")
+
+    def stop_breakline_tool(self):
+        tool = getattr(self, "breakline_tool", None)
+        self.breakline_tool = None
+        if tool is None:
+            return
+        try:
+            tool.reset()
+            self.canvas.unsetMapTool(tool)
+        except Exception:
+            log_ignored("interactive_dock.stop_breakline_tool")
+
+    def _handle_breakline(self, points, on_added=None):
+        """Keeps a drawn breakline if it crosses at least one displayed flow path.
+
+        The line is kept in the canvas coordinate reference system it was drawn
+        in, and moved into the flow layer's each time it is used, so it still
+        lands in the right place after Compute on another DEM.
+        """
+        if len(points) < 2:
+            return
+        if self.engine is None or not self._engine_layer_is_available("flow_layer"):
+            self.status_label.setText("The flow paths are gone; press 4. Compute before drawing breaklines.")
+            return
+        line = (QgsGeometry.fromPolylineXY([QgsPointXY(p) for p in points]),
+                self.canvas.mapSettings().destinationCrs())
+        if not self._flow_cells_crossed_by_outlet_geometry(self._breakline_in_flow_crs(line)):
+            self.status_label.setText("The breakline did not cross any displayed flow path; it was not added.")
+            return
+        self.breakline_geoms.append(line)
+        band = QgsRubberBand(self.canvas, enum_member(QgsWkbTypes, "GeometryType", "LineGeometry"))
+        if hasattr(band, "setStrokeColor"):
+            band.setStrokeColor(QColor(*self.BREAKLINE_COLOUR))
+        else:
+            band.setColor(QColor(*self.BREAKLINE_COLOUR))
+        band.setWidth(4)
+        try:
+            band.setLineStyle(qt_enum(Qt, "PenStyle", "DashLine"))
+        except Exception:
+            log_ignored("interactive_dock._handle_breakline")
+        band.setToGeometry(QgsGeometry.fromPolylineXY([QgsPointXY(p) for p in points]), None)
+        band.show()
+        self.breakline_bands.append(band)
+        self.status_label.setText(
+            f"Breakline added. {len(self.breakline_geoms)} breakline(s) will be applied at the next Process subcatchments."
+        )
+        if on_added is not None:
+            on_added()
+
+    def clear_breaklines(self):
+        """Removes every breakline from the canvas and from the next processing run."""
+        for band in list(getattr(self, "breakline_bands", [])):
+            try:
+                band.reset(enum_member(QgsWkbTypes, "GeometryType", "LineGeometry"))
+                band.hide()
+                self.canvas.scene().removeItem(band)
+            except Exception:
+                log_ignored("interactive_dock.clear_breaklines")
+        self.breakline_bands = []
+        self.breakline_geoms = []
+        try:
+            self.canvas.refresh()
+        except Exception:
+            log_ignored("interactive_dock.clear_breaklines")
+
+    def _breakline_in_flow_crs(self, line):
+        geom, crs = line
+        geom = QgsGeometry(geom)
+        flow_crs = self.engine.flow_layer.crs()
+        if crs != flow_crs:
+            geom.transform(QgsCoordinateTransform(crs, flow_crs, QgsProject.instance()))
+        return geom
+
+    def _handle_project_cleared(self):
+        self.stop_breakline_tool()
+        self.clear_breaklines()
+
+    def shutdown(self):
+        """Removes everything the plugin drew on the canvas, before the dock goes."""
+        window = getattr(self, "breakdown_window", None)
+        if window is not None:
+            try:
+                window._finished = True
+                window.close()
+            except RuntimeError:
+                log_ignored("interactive_dock.shutdown")
+        self.stop_breakline_tool()
+        self.clear_breaklines()
+        try:
+            self._clear_outlet_line_overlay()
+            self._clear_selection_polygon_overlay()
+        except RuntimeError:
+            log_ignored("interactive_dock.shutdown")
+
+    def breakline_cells(self):
+        """Cells each breakline cuts, one list per breakline.
+
+        Where a line crosses the same flow path at cells up to three steps apart,
+        only the lowest is kept, so no sliver is left between them. The walk stops
+        where another displayed path joins, so a crossed tributary keeps its own cut.
+        """
+        per_line = []
+        if self.engine is None or self.engine.downstream is None or not self._engine_layer_is_available("flow_layer"):
+            return per_line
+        displayed = getattr(self.engine, "display_strahler_by_cell", {}) or {}
+
+        def joined(cell):
+            return sum(1 for u in self.engine.upstream.get(cell, []) if u in displayed) >= 2
+
+        for line in getattr(self, "breakline_geoms", []):
+            geom = self._breakline_in_flow_crs(line)
+            crossed = [int(c) for c in self._flow_cells_crossed_by_outlet_geometry(geom)]
+            crossed_set = set(crossed)
+            kept = []
+            for cell in crossed:
+                cursor, shadowed = cell, False
+                for _step in range(3):
+                    cursor = int(self.engine.downstream[cursor])
+                    if cursor < 0 or joined(cursor):
+                        break
+                    if cursor in crossed_set:
+                        shadowed = True
+                        break
+                if not shadowed and cell not in kept:
+                    kept.append(cell)
+            per_line.append(kept)
+        return per_line
 
     def _clear_outlet_line_overlay(self):
         """Removes all outlet lines from the canvas and clears the stored outlet geometry."""
@@ -1420,7 +1584,7 @@ class DDMHydroLogicDock(QDockWidget):
             valid_ids = set()
             if raw_valid_ids is not None:
                 try:
-                    valid_ids = set(int(c) for c in list(raw_valid_ids))
+                    valid_ids = set(raw_valid_ids.tolist() if hasattr(raw_valid_ids, "tolist") else raw_valid_ids)
                 except Exception:
                     try:
                         valid_ids = set(int(c) for c in raw_valid_ids)
@@ -1974,7 +2138,7 @@ class DDMHydroLogicDock(QDockWidget):
             except Exception:
                 outlet_cell = int(cells[0])
             try:
-                upstream = set(int(c) for c in self.engine.collect_upstream(int(outlet_cell)))
+                upstream = set(self.engine.collect_upstream(int(outlet_cell)))
             except Exception:
                 log_ignored("interactive_dock._tuflow_catchment_groups")
                 continue
@@ -2074,10 +2238,11 @@ class DDMHydroLogicDock(QDockWidget):
             try:
                 # Re-apply the in-session Strahler renderer so the loaded output
                 # displays as blue graduated lines immediately, even on builds
-                # that ignore a newly stored GeoPackage default style.
+                # that ignore a newly stored GeoPackage default style. The style
+                # itself was saved into the GeoPackage right after writing; saving
+                # it a second time freezes QGIS 3.22.
                 if self.engine is not None:
                     self.engine._style_flow_layer(flow_layer)
-                self._save_layer_style_to_gpkg(flow_layer, path, "flow_paths", "DDM Strahler order")
             except Exception:
                 log_ignored("interactive_dock._load_exported_gpkg_layers")
             QgsProject.instance().addMapLayer(flow_layer)

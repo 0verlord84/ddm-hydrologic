@@ -49,6 +49,7 @@ class DDMHydroLogicPlugin:
     def unload(self):
         """Called by QGIS when the plugin is disabled."""
         if self.dock is not None:
+            self.dock.shutdown()
             self.iface.removeDockWidget(self.dock)
             self.dock.deleteLater()
             self.dock = None

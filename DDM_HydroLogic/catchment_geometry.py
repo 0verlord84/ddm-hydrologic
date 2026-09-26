@@ -361,13 +361,22 @@ def subarea_metrics(engine, features: Dict[int, object], assignments: Dict[int, 
 
     Each entry carries the centroid, the sub-area entry point, the main stream
     and its length/slope, and the equal-area catchment slope.
+
+    A model export measures the subareas and its companion shapefiles measure
+    them again, so results are kept on the engine keyed by the exact cells and
+    centroid. The engine clears them whenever it builds a new subcatchment layer.
     """
+    cache = getattr(engine, "metrics_cache", None)
     metrics: Dict[int, dict] = {}
     for outlet in outlets:
         outlet = int(outlet)
         member = {int(c) for c in (assignments.get(outlet) or [])}
         feat = features[outlet]
         cx, cy, inside = centroid_of(feat)
+        key = (outlet, cx, cy, frozenset(member)) if isinstance(cache, dict) else None
+        if key is not None and key in cache:
+            metrics[outlet] = dict(cache[key])
+            continue
         stem = main_stem(engine, outlet, member)
         entry = entry_cell(engine, stem, (cx, cy))
         stem_length_m = path_length_m(engine, stem)
@@ -381,6 +390,8 @@ def subarea_metrics(engine, features: Dict[int, object], assignments: Dict[int, 
             "channel_slope": equal_area_slope(engine, stem),
             "catchment_slope": equal_area_slope(engine, catchment_profile(engine, outlet, member)),
         }
+        if key is not None:
+            cache[key] = dict(metrics[outlet])
     return metrics
 
 

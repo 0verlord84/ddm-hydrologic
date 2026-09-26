@@ -12,7 +12,8 @@
 This is where subcatchments are made. The window splits the catchment by number
 of subcatchments, by minimum subcatchment size or by Strahler order, and lists
 every subcatchment with its areas, the area reporting to it from upstream and
-its main-stream slope.
+its main-stream slope. Breaklines drawn from here force a boundary wherever they
+cross a flow path, in every mode.
 
 There is only ever one subcatchment layer. Each Process overwrites it in place.
 Close asks before putting back whatever was there when the window opened, and
@@ -170,18 +171,42 @@ class BreakdownDialog(QDialog):
         self.orders = self._available_orders()
         top_order = max(self.orders) if self.orders else 1
         self.strahler_spin.setRange(1, max(1, top_order))
-        self.order_hint = QLabel(
-            f"highest order on the displayed flow paths: {top_order}" if self.orders
-            else "no Strahler orders on the displayed flow paths"
-        )
+        self.order_hint = QLabel("")
+        self.order_hint.setWordWrap(True)
         self.strahler_spin.setToolTip(
-            "Subcatchments are cut at stream confluences of this order or above. Strahler order "
-            "only exists on the flow paths the accumulation threshold displays, so a coarse "
-            "threshold leaves fewer orders to cut on."
+            "Every stream of this order becomes one subcatchment with everything that drains into it. "
+            "The area draining straight into higher-order streams is cut into pieces of about the "
+            "average size of those subcatchments. The highest order gives one subcatchment per outlet. "
+            "Strahler order only exists on the flow paths the accumulation threshold displays, so a "
+            "coarse threshold leaves fewer orders."
         )
-        process_layout.addLayout(self._mode_row(self.strahler_radio, [self.strahler_spin, self.order_hint]))
+        process_layout.addLayout(self._mode_row(self.strahler_radio, [self.strahler_spin, self.order_hint],
+                                                expand_last=True))
+
+        self.breakline_btn = QPushButton("Breaklines")
+        self.breakline_btn.setCheckable(True)
+        self.clear_breaklines_btn = QPushButton("Clear breaklines")
+        self.breakline_text = QLabel(
+            "Draw lines across flow paths where a subcatchment boundary must fall. Every flow path a "
+            "breakline crosses becomes a subcatchment outlet at the next Process. Left-click to add "
+            "vertices, right-click to finish a line; press Breaklines again or Escape to stop."
+        )
+        self.breakline_text.setWordWrap(True)
+        self.breakline_count = QLabel("")
+        breakline_row = QHBoxLayout()
+        breakline_buttons = QVBoxLayout()
+        breakline_buttons.addWidget(self.breakline_btn)
+        breakline_buttons.addWidget(self.clear_breaklines_btn)
+        breakline_buttons.addWidget(self.breakline_count)
+        breakline_row.addLayout(breakline_buttons)
+        breakline_row.addWidget(self.breakline_text, 1)
+        process_layout.addLayout(breakline_row)
 
         self.process_btn = QPushButton("Process subcatchments")
+        # Enter runs Process, as it did before the breakline buttons came first.
+        self.breakline_btn.setAutoDefault(False)
+        self.clear_breaklines_btn.setAutoDefault(False)
+        self.process_btn.setDefault(True)
         process_row = QHBoxLayout()
         process_row.addStretch(1)
         process_row.addWidget(self.process_btn)
@@ -221,6 +246,11 @@ class BreakdownDialog(QDialog):
         for radio in (self.count_radio, self.area_radio, self.strahler_radio):
             radio.toggled.connect(self._sync_mode)
         self.unit_combo.currentIndexChanged.connect(self._unit_changed)
+        self.strahler_spin.valueChanged.connect(lambda _value: self._update_order_hint())
+        self.breakline_btn.toggled.connect(self._toggle_breaklines)
+        self.clear_breaklines_btn.clicked.connect(self._clear_breaklines)
+        self._update_order_hint()
+        self._update_breakline_count()
         self.process_btn.clicked.connect(self.process)
         self.csv_btn.clicked.connect(self.export_csv)
         self.close_btn.clicked.connect(self.reject)
@@ -229,13 +259,80 @@ class BreakdownDialog(QDialog):
         self.table.itemChanged.connect(self._note_edited)
 
     @staticmethod
-    def _mode_row(radio, widgets):
+    def _mode_row(radio, widgets, expand_last=False):
         row = QHBoxLayout()
         row.addWidget(radio)
-        for widget in widgets:
-            row.addWidget(widget)
-        row.addStretch(1)
+        for position, widget in enumerate(widgets, start=1):
+            row.addWidget(widget, 1 if expand_last and position == len(widgets) else 0)
+        if not expand_last:
+            row.addStretch(1)
         return row
+
+    def _update_order_hint(self):
+        """Shows the highest order, and warns when it is the one selected."""
+        if not self.orders:
+            self.order_hint.setText("no Strahler orders on the displayed flow paths")
+            self.order_hint.setStyleSheet("")
+            return
+        top_order = max(self.orders)
+        if int(self.strahler_spin.value()) >= top_order:
+            self.order_hint.setText(
+                f"highest order on the displayed flow paths: {top_order}. Choosing {top_order} gives one "
+                "subcatchment per outlet, split only by breaklines."
+            )
+            self.order_hint.setStyleSheet("color: #b35c00; font-weight: bold;")
+        else:
+            self.order_hint.setText(f"highest order on the displayed flow paths: {top_order}")
+            self.order_hint.setStyleSheet("")
+
+    # ------------------------------------------------------------------
+    # breaklines
+    # ------------------------------------------------------------------
+    def _toggle_breaklines(self, drawing):
+        if drawing:
+            self.dock.start_breakline_tool(on_added=self._update_breakline_count,
+                                           on_stopped=lambda: self.breakline_btn.setChecked(False))
+            self.dock.status_label.setText(
+                "Drawing breaklines: left-click to add vertices, right-click to finish a line. "
+                "Press Breaklines again or Escape to stop."
+            )
+        else:
+            was_drawing = self.dock.breakline_tool is not None
+            self.dock.stop_breakline_tool()
+            if was_drawing:
+                self.dock.status_label.setText(
+                    f"Breakline drawing stopped. {len(self.dock.breakline_geoms)} breakline(s) will be applied at "
+                    "the next Process subcatchments."
+                )
+
+    def keyPressEvent(self, event):  # pylint: disable=invalid-name
+        """Escape stops breakline drawing first, rather than closing the window."""
+        if event.key() == qt_enum(Qt, "Key", "Key_Escape") and self.breakline_btn.isChecked():
+            self.breakline_btn.setChecked(False)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _clear_breaklines(self):
+        self.breakline_btn.setChecked(False)
+        self.dock.clear_breaklines()
+        self._update_breakline_count()
+        self.dock.status_label.setText("Breaklines cleared.")
+
+    def _update_breakline_count(self):
+        count = len(getattr(self.dock, "breakline_geoms", []))
+        self.breakline_count.setText(f"{count} breakline(s)")
+        self.clear_breaklines_btn.setEnabled(bool(count) and self.process_btn.isEnabled())
+
+    def _breakline_cuts(self, boundary):
+        """Cut cells from the breaklines, and how many breaklines cut nothing in the processed area."""
+        cuts, unused = [], 0
+        for cells in self.dock.breakline_cells():
+            inside, _outside = self.engine.forced_cells_in_domain(cells, boundary)
+            if not inside:
+                unused += 1
+            cuts.extend(c for c in inside if c not in cuts)
+        return cuts, unused
 
     def _available_orders(self):
         try:
@@ -307,8 +404,9 @@ class BreakdownDialog(QDialog):
 
     def _set_controls_enabled(self, enabled):
         for widget in (self.count_radio, self.area_radio, self.strahler_radio, self.process_btn,
-                       self.csv_btn, self.close_btn, self.table):
+                       self.csv_btn, self.close_btn, self.table, self.breakline_btn):
             widget.setEnabled(bool(enabled))
+        self.clear_breaklines_btn.setEnabled(bool(enabled) and bool(getattr(self.dock, "breakline_geoms", [])))
         if enabled:
             self._sync_mode()
             self.strahler_radio.setEnabled(bool(self.orders))
@@ -576,6 +674,7 @@ class BreakdownDialog(QDialog):
             self.whole_dem_accepted = True
 
         settings = self._current_settings()
+        self.breakline_btn.setChecked(False)
         self.dock.abort_requested = False
         self.dock.active_operation = "breakdown"
         self.dock._set_busy(True)
@@ -583,17 +682,23 @@ class BreakdownDialog(QDialog):
         finished = False
         warning = ""
         try:
+            cuts, unused_breaklines = self._breakline_cuts(boundary)
             if settings["mode"] == MODE_COUNT:
                 target = settings["count"]
-                assignments, achieved, cells = self.engine.build_target_count_subcatchments(target, boundary)
+                assignments, achieved, cells = self.engine.build_target_count_subcatchments(
+                    target, boundary, forced_cells=cuts)
                 if achieved != target:
                     floor = self.engine.terminal_outlet_count(boundary)
-                    if target < floor:
+                    minimum = self.engine.minimum_subcatchment_count(boundary, cuts)
+                    extra = minimum - floor
+                    if target < minimum:
+                        breakline_part = f", and the breaklines force {extra:,} more cut(s)" if extra > 0 else ""
                         warning = (
                             f"{achieved:,} subcatchments were created against the {target:,} requested. "
                             f"The catchment drains out at {floor:,} separate points, and each of those has to be "
-                            f"a subcatchment, so {floor:,} is the fewest possible. An outlet line makes one of "
-                            "these for every flow path it crosses; draw it across a single flow path to allow fewer."
+                            f"a subcatchment{breakline_part}, so {minimum:,} is the fewest possible. An outlet line "
+                            "makes one of these for every flow path it crosses; draw it across a single flow path "
+                            "to allow fewer."
                         )
                     else:
                         warning = (
@@ -605,13 +710,21 @@ class BreakdownDialog(QDialog):
             elif settings["mode"] == MODE_AREA:
                 cells, described = self._requested_cells()
                 assignments = self.engine.build_area_threshold_subcatchments(
-                    min_cells=cells, boundary_outlet_cells=boundary, include_residual=True)
+                    min_cells=cells, boundary_outlet_cells=boundary, include_residual=True, forced_cells=cuts)
                 description = f"minimum subcatchment size {described}"
             else:
                 order = settings["order"]
-                assignments = self.engine.build_strahler_confluence_subcatchments(order, boundary)
+                assignments, info = self.engine.build_strahler_subcatchments(order, boundary, forced_cells=cuts)
                 cells = None
-                description = f"confluences of Strahler order {order} and above"
+                average_ha = info["threshold_cells"] * float(getattr(self.engine, "cell_area", 0.0) or 0.0) / 10000.0
+                absorbed = f", {info['absorbed']:,} sliver(s) absorbed" if info["absorbed"] else ""
+                if self.orders and order >= max(self.orders):
+                    description = f"Strahler order {order} (the highest: one subcatchment per outlet)"
+                else:
+                    description = (
+                        f"Strahler order {order} ({info['basins']:,} order-{order} stream subcatchment(s), "
+                        f"the rest cut to about {average_ha:,.2f} ha{absorbed})"
+                    )
 
             if not assignments:
                 QMessageBox.warning(
@@ -631,8 +744,14 @@ class BreakdownDialog(QDialog):
             self.pending_settings = settings
             self.reload_table()
             finished = True
+            breakline_note = ""
+            if cuts:
+                breakline_note += f" Breaklines cut {len(cuts):,} flow path(s)."
+            if unused_breaklines:
+                breakline_note += (f" {unused_breaklines:,} breakline(s) crossed no flow path inside the "
+                                   "processed area and were ignored.")
             self.dock.status_label.setText(
-                f"Subcatchments processed by {description}: {len(assignments):,} subcatchment(s). "
+                f"Subcatchments processed by {description}: {len(assignments):,} subcatchment(s).{breakline_note} "
                 "Confirm or close the Subcatchments breakdown window."
             )
             if warning:
@@ -741,6 +860,7 @@ class BreakdownDialog(QDialog):
         if self._cleaned_up:
             return
         self._cleaned_up = True
+        self.dock.stop_breakline_tool()
         self._clear_highlight()
         if getattr(self.dock, "breakdown_window", None) is self:
             self.dock.breakdown_window = None

@@ -24,12 +24,12 @@ class DrawOutletLineTool(QgsMapTool):
     lineFinished = pyqtSignal(list)
     cancelled = pyqtSignal()
 
-    def __init__(self, canvas):
+    def __init__(self, canvas, color=None):
         super().__init__(canvas)
         self.canvas = canvas
         self.points = []
         self.rubber_band = QgsRubberBand(canvas, enum_member(QgsWkbTypes, "GeometryType", "LineGeometry"))
-        self.rubber_band.setColor(QColor(220, 0, 0, 235))
+        self.rubber_band.setColor(color if color is not None else QColor(220, 0, 0, 235))
         self.rubber_band.setWidth(5)
         self.setCursor(QCursor(qt_enum(Qt, "CursorShape", "CrossCursor")))
 

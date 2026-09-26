@@ -2,7 +2,13 @@
 
 **From DEM to model-ready catchments in QGIS.**
 
-**v2.3 now features:**
+**v2.4 now features:**
+1. Set by Strahler order - streams of the chosen order become one subcatchment each, with everything draining into them, and the rest of the catchment is cut into pieces of about their average size. The highest order gives one subcatchment per outlet, and the window warns when it is selected.
+2. Breaklines - lines drawn in the Subcatchments breakdown window force a subcatchment boundary wherever they cross a flow path, in all three modes.
+3. Faster - processing subcatchments is about 20 times faster, and computing flow paths, clicking flow paths and exporting are faster too. The n. of subcatchments and minimum size modes give the same subcatchments as v2.3.
+4. QGIS 3.22 - exporting to GeoPackage no longer freezes QGIS.
+
+**v2.3:**
 1. Subcatchments breakdown - This function invokes a window to further enhance the subcatchment delineation. Three possible ways: based on n. of subcatchments, minimum subcatchment size in pixel/m2/km2/ha, or Strahler order. A summary table is displayed to select, identify on map and review them.
   1.1. Ability to reprocess the subcatchment before committing.
   1.2. "Label" field editable.
@@ -39,7 +45,7 @@ Setting up a hydrologic model usually means a few hours of GIS prep work before 
 
 It is important to note that all hydrological/hydraulic choices, such as rainfall, losses, Manning's coefficients, subcatchment types, impervious fractions, etc.. have been deliberately left blank or default values. Anything the DEM can measure - sub-area areas, reach lengths and slopes - is calculated and written into the model files.
 
-Current version: **2.3** · QGIS 3.22 LTR and 4.x
+Current version: **2.4** · QGIS 3.22 LTR and 4.x
 
 ## Workflow
 
@@ -49,7 +55,7 @@ Current version: **2.3** · QGIS 3.22 LTR and 4.x
 4. Press **Compute** to build temporary Strahler-ordered flow paths. If the mask is outside the DEM, the plugin shows a caution prompt. If NoData cells are detected in the active analysis domain, the areas are flagged as problematic.
 5. Click flow paths to highlight upstream contributing subcatchment. CTRL + left-click to de-select an area.
 6. (Optional) Draw an outlet line -> Recommended for hydrological modelling exports.
-7. Press **7. Subcatchments breakdown**, choose how to split the catchment and press **Process subcatchments**. If successful, the plugin reports temporal layers with spatial representation of subcatchments and strahler-ordered flow lines. Review the table, then press **Confirm new subcatchments**.
+7. Press **7. Subcatchments breakdown**, choose how to split the catchment, draw any **Breaklines** and press **Process subcatchments**. If successful, the plugin reports temporal layers with spatial representation of subcatchments and strahler-ordered flow lines. Review the table, then press **Confirm new subcatchments**.
 8. Export vectors as a geopackage or straight into your favourite hydrological model and go from there.
 
 ## Outputs
@@ -75,9 +81,24 @@ frame at the top splits the catchment three ways:
 - **Set by minimum subcatchment size** takes a number and a unit (pixel, m2, km2 or
   ha) and makes each subcatchment that size or larger, as closely as the flow paths
   allow. Changing the unit keeps the same area. The default is 100,000 m2.
-- **Set by Strahler order** cuts at stream confluences of the order entered or
-  above. Strahler order only exists on the flow paths the step-2 accumulation
+- **Set by Strahler order** makes every stream of the order entered one
+  subcatchment, with everything that drains into it. The rest of the catchment,
+  the area draining straight into higher-order streams, is cut into pieces of about
+  the average size of those subcatchments. A leftover smaller than half that size
+  at an outlet or a breakline is merged with the smallest piece draining straight
+  into it; a leftover with nothing above it, such as a small flow path the outlet
+  line crosses, stays. The highest
+  order gives one subcatchment per outlet, and the window warns when it is
+  selected. Strahler order only exists on the flow paths the step-2 accumulation
   threshold displays, so the window shows the highest order available.
+
+**Breaklines** lets you draw lines across flow paths where a subcatchment boundary
+must fall, like outlet lines: left-click to add vertices, right-click to finish a
+line, press Breaklines again or Escape to stop. Every flow path a breakline crosses
+becomes a subcatchment outlet at the next **Process subcatchments**, whichever of
+the three ways is selected. Breaklines are drawn dashed in orange and stay until
+**Clear breaklines** is pressed. A breakline that crosses no flow path inside the
+processed area is ignored, and the status line says so.
 
 **Process subcatchments** draws the result on the map and fills the table below: the
 QGIS-side ID, the area in m2, km2 and ha, a Label you can type into, the total area
