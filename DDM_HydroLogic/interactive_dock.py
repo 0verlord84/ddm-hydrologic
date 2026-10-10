@@ -18,7 +18,10 @@ from qgis.PyQt.QtCore import Qt, QTimer, QVariant
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDockWidget,
     QFileDialog,
     QFormLayout,
@@ -34,6 +37,7 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 from qgis.core import (
+    QgsCategorizedSymbolRenderer,
     QgsCoordinateTransform,
     QgsExpression,
     QgsExpressionContext,
@@ -46,6 +50,7 @@ from qgis.core import (
     QgsProject,
     QgsFillSymbol,
     QgsRasterLayer,
+    QgsRendererCategory,
     QgsVectorFileWriter,
     QgsVectorLayer,
     QgsWkbTypes,
@@ -55,7 +60,7 @@ from qgis.gui import QgsMapToolEmitPoint, QgsRubberBand
 
 from .compat import OUT_OF_MEMORY, enum_member, failure_text, free_memory_bytes, log_ignored, qt_enum
 from .breakdown_dialog import BreakdownDialog
-from .hydrology_engine import D8HydrologyEngine, HydrologyBuildError, HydrologyCancelled
+from .hydrology_engine import GAP_WIDTH, D8HydrologyEngine, HydrologyBuildError, HydrologyCancelled
 from .map_tools import DrawOutletLineTool, DrawMaskPolygonTool
 from .rorb_catg_exporter import RorbCatgExportError, write_rorb_catg_from_engine
 from .tuflow_exporter import TUFLOW_LAYERS, TuflowExportError, write_tuflow_from_engine
@@ -80,6 +85,83 @@ def _writer_action(member):
         return enum_member(QgsVectorFileWriter, "ActionOnExistingFile", member)
     except AttributeError:
         return None
+
+
+# Largest area 2. Display flow paths from area (m2) takes.
+MAX_DISPLAY_AREA = 2000000000
+
+NODATA_WARNING = (
+    'WARNING: NoData values have been detected. This may output unrealistic results - please review the '
+    '"NoData - problematic areas" layer. It is recommended to quality check the DEM. Do you still wish to continue?'
+)
+GAP_LABEL = f"Gap up to {GAP_WIDTH} cells wide"
+
+
+def _ask(parent, title, text, extra=None, tick=None):
+    """Asks a Yes/No question, with an optional third button and an optional tick box.
+
+    ``extra`` is the third button's text and ``tick`` a ``(text, ticked)`` pair.
+    Returns the answer, "yes", "no" or "extra", and whether the box was left
+    ticked (None without one).
+    """
+    box = QMessageBox(parent)
+    box.setIcon(enum_member(QMessageBox, "Icon", "Question"))
+    box.setWindowTitle(title)
+    box.setText(text)
+    yes = box.addButton(enum_member(QMessageBox, "StandardButton", "Yes"))
+    other = box.addButton(extra, enum_member(QMessageBox, "ButtonRole", "AcceptRole")) if extra else None
+    no = box.addButton(enum_member(QMessageBox, "StandardButton", "No"))
+    box.setDefaultButton(no)
+    box.setEscapeButton(no)
+    check = None
+    if tick is not None:
+        check = QCheckBox(tick[0])
+        check.setChecked(bool(tick[1]))
+        box.setCheckBox(check)
+    box.exec()
+    clicked = box.clickedButton()
+    if clicked == yes:
+        answer = "yes"
+    elif other is not None and clicked == other:
+        answer = "extra"
+    else:
+        answer = "no"
+    return answer, (check.isChecked() if check is not None else None)
+
+
+def _choose_mask_layer(parent, layers, current=None):
+    """Asks which polygon layer to take the mask from.
+
+    Returns ``(layer, selected features only)``, or None when cancelled.
+    """
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("Use layer as mask")
+    form = QFormLayout(dialog)
+    combo = QComboBox()
+    for layer in layers:
+        combo.addItem(layer.name())
+    if current in layers:
+        combo.setCurrentIndex(layers.index(current))
+    selected = QCheckBox()
+
+    def refresh(_index=None):
+        count = layers[combo.currentIndex()].selectedFeatureCount()
+        selected.setText(f"Selected features only ({count:,} selected)")
+        selected.setEnabled(count > 0)
+        selected.setChecked(count > 0)
+
+    combo.currentIndexChanged.connect(refresh)
+    refresh()
+    buttons = QDialogButtonBox(enum_member(QDialogButtonBox, "StandardButton", "Ok")
+                               | enum_member(QDialogButtonBox, "StandardButton", "Cancel"))
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    form.addRow("Polygon layer", combo)
+    form.addRow(selected)
+    form.addRow(buttons)
+    if not dialog.exec():
+        return None
+    return layers[combo.currentIndex()], selected.isEnabled() and selected.isChecked()
 
 
 class DDMHydroLogicDock(QDockWidget):
@@ -144,8 +226,8 @@ class DDMHydroLogicDock(QDockWidget):
         dem_group = QGroupBox("DEM and flow path processing")
         dem_layout = QFormLayout(dem_group)
         dem_caution = QLabel(
-            "CAUTION: lower accumulation numbers increase processing time. "
-            "Example: for a 5m DEM a value of 10,000 is a good starting point."
+            "CAUTION: Lower areas increase processing time. "
+            "Example: for a 5m DEM, a 250,000 m2 area is a good starting point"
         )
         dem_caution.setWordWrap(True)
         dem_layout.addRow(dem_caution)
@@ -157,24 +239,44 @@ class DDMHydroLogicDock(QDockWidget):
         dem_row.addWidget(self.refresh_btn)
         dem_layout.addRow("1. DEM", dem_row)
 
-        self.min_acc_spin = QSpinBox()
-        self.min_acc_spin.setRange(1, 100000000)
-        self.min_acc_spin.setValue(10000)
-        self.min_acc_spin.setToolTip(
-            "Minimum accumulation, in DEM cells, to display as flow-path line features. "
-            "Use 1 for every cell-sized path. Larger values are much lighter on QGIS."
+        self.min_area_spin = QSpinBox()
+        self.min_area_spin.setRange(1, MAX_DISPLAY_AREA)
+        self.min_area_spin.setSingleStep(10000)
+        self.min_area_spin.setGroupSeparatorShown(True)
+        self.min_area_spin.setValue(250000)
+        self.min_area_spin.setToolTip(
+            "Minimum upstream area, in m2, to display as flow-path line features. "
+            "Larger values are much lighter on QGIS."
         )
-        dem_layout.addRow("2. Display flow paths from flow accumulation", self.min_acc_spin)
+        dem_layout.addRow("2. Display flow paths from area (m2)", self.min_area_spin)
 
         self.mask_btn = QPushButton("Create polygon")
         self.mask_btn.setToolTip(
             "Optional. Left-click to digitise a polygon on the map canvas. "
             "The polygon is used as the boundary for all processes."
         )
-        dem_layout.addRow("3. Mask layer", self.mask_btn)
+        self.mask_layer_btn = QPushButton("Use layer")
+        self.mask_layer_btn.setToolTip(
+            "Optional. Uses the polygons of a layer already in the project as the mask, "
+            "all of them or only the selected ones."
+        )
+        mask_row = QHBoxLayout()
+        mask_row.addWidget(self.mask_btn, 1)
+        mask_row.addWidget(self.mask_layer_btn, 1)
+        dem_layout.addRow("3. Mask layer", mask_row)
 
         self.build_btn = QPushButton("Compute")
-        dem_layout.addRow("4. Create flow paths", self.build_btn)
+        self.fill_gaps_check = QCheckBox("Fill narrow NoData gaps")
+        self.fill_gaps_check.setChecked(True)
+        self.fill_gaps_check.setToolTip(
+            f"Fills NoData gaps up to {GAP_WIDTH} cells wide inside the DEM, such as seams between tiles, "
+            "from the cells either side before routing, so streams carry on across them. Wider holes and "
+            "the NoData round the outside of the data are left as they are."
+        )
+        build_row = QHBoxLayout()
+        build_row.addWidget(self.build_btn, 1)
+        build_row.addWidget(self.fill_gaps_check)
+        dem_layout.addRow("4. Create flow paths", build_row)
         layout.addWidget(dem_group)
 
         interact_group = QGroupBox("Interactive flow path selection")
@@ -286,6 +388,7 @@ class DDMHydroLogicDock(QDockWidget):
 
         self.refresh_btn.clicked.connect(self.refresh_dem_layers)
         self.mask_btn.clicked.connect(self.activate_mask_tool)
+        self.mask_layer_btn.clicked.connect(self.use_mask_layer)
         self.build_btn.clicked.connect(self.build_flow_paths)
         self.click_btn.clicked.connect(self.activate_click_tool)
         self.draw_btn.clicked.connect(self.activate_draw_tool)
@@ -404,13 +507,6 @@ class DDMHydroLogicDock(QDockWidget):
         self.progress.setValue(0)
         self.status_label.setText("Flow-path processing cancelled. Mask polygon and temporary plugin outputs were cleared; reproject the DEM or select Yes to proceed with the current CRS.")
 
-    def _canvas_crs_uri(self):
-        crs = self.canvas.mapSettings().destinationCrs()
-        authid = crs.authid()
-        if authid:
-            return authid
-        return crs.toWkt()
-
     def _mask_layer_is_available(self):
         layer = getattr(self, "mask_layer", None)
         layer_id = self._layer_id_safe(layer)
@@ -488,6 +584,80 @@ class DDMHydroLogicDock(QDockWidget):
         if not points or len(points) < 3:
             self.status_label.setText("Mask polygon was not created because fewer than 3 vertices were supplied.")
             return
+        ring = [QgsPointXY(p) for p in points]
+        if ring[0] != ring[-1]:
+            ring.append(QgsPointXY(ring[0]))
+        self._set_mask_geometry(
+            QgsGeometry.fromPolygonXY([ring]),
+            self.canvas.mapSettings().destinationCrs(),
+            "Polygon",
+            "Mask polygon created. Existing temporary flow paths/highlights/subcatchments were cleared. "
+            "Press Compute to process only the DEM cells inside the mask.",
+        )
+
+    def use_mask_layer(self):
+        """Takes the mask polygon from a polygon layer already in the project."""
+        if self.selected_dem_layer() is None:
+            QMessageBox.warning(self, "DDM HydroLogic", "Load/select a DEM raster before creating a mask polygon.")
+            return
+        layers = self._polygon_layers()
+        if not layers:
+            QMessageBox.warning(self, "DDM HydroLogic", "Load a polygon layer into the project to use it as the mask.")
+            return
+        active = getattr(self.iface, "activeLayer", None)
+        choice = _choose_mask_layer(self, layers, active() if callable(active) else None)
+        if choice is None:
+            self.status_label.setText("Use layer cancelled. The mask was not changed.")
+            return
+        self._mask_from_layer(*choice)
+
+    def _polygon_layers(self):
+        """Polygon layers in the project that can give the mask, apart from the plugin's own mask and NoData layers."""
+        polygon = enum_member(QgsWkbTypes, "GeometryType", "PolygonGeometry")
+        layers = []
+        for layer in QgsProject.instance().mapLayers().values():
+            try:
+                if not isinstance(layer, QgsVectorLayer) or not layer.isValid():
+                    continue
+                name = layer.name()
+                if name == "NoData - problematic areas" or name.startswith("DDM HydroLogic mask polygon"):
+                    continue
+                if QgsWkbTypes.geometryType(layer.wkbType()) == polygon:
+                    layers.append(layer)
+            except RuntimeError:
+                log_ignored("interactive_dock._polygon_layers")
+        return sorted(layers, key=lambda layer: layer.name().lower())
+
+    def _mask_from_layer(self, layer, selected_only=False):
+        """Makes the mask polygon from a layer's polygons, all of them or only the selected ones."""
+        features = layer.getSelectedFeatures() if selected_only else layer.getFeatures()
+        geoms = []
+        for feat in features:
+            geom = feat.geometry()
+            if geom is None or geom.isNull() or geom.isEmpty():
+                continue
+            geom = QgsGeometry(geom)
+            if QgsWkbTypes.isCurvedType(geom.wkbType()):
+                geom.convertToStraightSegment()
+            geom.get().dropZValue()
+            geom.get().dropMValue()
+            geoms.append(geom)
+        if not geoms:
+            self.status_label.setText(f"{layer.name()} has no polygons to use as the mask. The mask was not changed.")
+            return
+        geom = geoms[0] if len(geoms) == 1 else QgsGeometry.unaryUnion(geoms)
+        which = "selected " if selected_only else ""
+        self._set_mask_geometry(
+            geom,
+            layer.crs(),
+            "MultiPolygon",
+            f"Mask polygon taken from the {len(geoms):,} {which}feature(s) of {layer.name()}. Existing temporary "
+            "flow paths/highlights/subcatchments were cleared. Press Compute to process only the DEM cells inside "
+            "the mask.",
+        )
+
+    def _set_mask_geometry(self, geom, crs, geometry_type, status):
+        """Makes ``geom`` the mask polygon, clearing everything the previous mask produced."""
         try:
             self._remove_mask_layer_if_present()
             self._remove_all_plugin_temporary_layers(include_flow=True, include_highlight=True, include_subcatchments=True)
@@ -504,25 +674,25 @@ class DDMHydroLogicDock(QDockWidget):
             self._clear_selection_polygon_overlay()
             self._clear_outlet_line_overlay()
 
-            ring = [QgsPointXY(p) for p in points]
-            if ring[0] != ring[-1]:
-                ring.append(QgsPointXY(ring[0]))
-            geom = QgsGeometry.fromPolygonXY([ring])
-            if geom.isNull() or geom.isEmpty():
-                raise RuntimeError("The drawn polygon geometry is empty.")
+            if geom is None or geom.isNull() or geom.isEmpty():
+                raise RuntimeError("The mask polygon geometry is empty.")
             try:
                 if not geom.isGeosValid():
                     fixed = geom.buffer(0, 1)
                     if not fixed.isNull() and not fixed.isEmpty():
                         geom = fixed
             except Exception:
-                log_ignored("interactive_dock._handle_mask_polygon")
+                log_ignored("interactive_dock._set_mask_geometry")
+            if geometry_type == "MultiPolygon" and not geom.isMultipart():
+                geom.convertToMultiType()
 
+            authid = crs.authid()
             layer = QgsVectorLayer(
-                f"Polygon?crs={self._canvas_crs_uri()}",
+                f"{geometry_type}?crs={authid or crs.toWkt()}",
                 "DDM HydroLogic mask polygon - temporary",
                 "memory",
             )
+            layer.setCrs(crs)
             provider = layer.dataProvider()
             feature = QgsFeature(layer.fields())
             feature.setGeometry(geom)
@@ -537,14 +707,12 @@ class DDMHydroLogicDock(QDockWidget):
             QgsProject.instance().addMapLayer(layer)
             self.mask_layer = layer
             self.progress.setValue(100)
-            self.status_label.setText(
-                "Mask polygon created. Existing temporary flow paths/highlights/subcatchments were cleared. "
-                "Press Compute to process only the DEM cells inside the mask."
-            )
+            self.status_label.setText(status)
             self.canvas.refresh()
         except Exception as exc:
             QMessageBox.critical(self, "DDM HydroLogic", f"Could not create mask polygon:\n\n{exc}")
             self.status_label.setText("Mask polygon creation failed.")
+        self._refresh_step_gating()
 
     def _mask_is_definitely_outside_dem_extent(self, dem_layer):
         """Returns True when the temporary mask polygon does not intersect the DEM extent.
@@ -579,114 +747,103 @@ class DDMHydroLogicDock(QDockWidget):
         except Exception:
             return False
 
-    def _analysis_mask_warning_passed(self, dem_layer):
-        """Runs separate mask-outside and NoData preflight warnings before Compute."""
-        if not self._mask_layer_is_available():
-            return True
-        if self._mask_is_definitely_outside_dem_extent(dem_layer):
-            response = QMessageBox.question(
-                self,
-                "Mask polygon outside DEM",
-                "CAUTION: the mask polygon is outside the DEM. Do you still wish to continue?",
-                enum_member(QMessageBox, "StandardButton", "Yes") | enum_member(QMessageBox, "StandardButton", "No"),
-                enum_member(QMessageBox, "StandardButton", "No"),
-            )
-            if response == enum_member(QMessageBox, "StandardButton", "Yes"):
-                return True
-            self._remove_mask_layer_if_present()
-            self.status_label.setText("Compute cancelled. The mask layer was cleared.")
-            return False
-        checker = D8HydrologyEngine(
-            dem_layer,
-            lambda pct, msg: None,
-            self._abort_has_been_requested,
-            mask_layer=self.mask_layer,
-        )
-        try:
-            info = checker.inspect_analysis_mask_quality()
-            self._compute_memory_estimate = checker.memory_estimate()
-        except HydrologyBuildError:
-            info = {
-                "mask_cells": int(getattr(checker, "mask_raster_cell_count", 0) or 0),
-                "valid_cells": int(getattr(checker, "mask_cell_count", 0) or 0),
-                "nodata_cells": int(getattr(checker, "mask_nodata_cell_count", 0) or 0),
-            }
-        except Exception:
-            return True
-
-        mask_cells = int(info.get("mask_cells", 0) or 0)
-        valid_cells = int(info.get("valid_cells", 0) or 0)
-        nodata_cells = int(info.get("nodata_cells", 0) or 0)
-
-        # Case 1: the mask does not capture any DEM cells/valid DEM cells. Keep
-        # this warning separate from the NoData warning.
-        if mask_cells <= 0 or valid_cells <= 0:
-            response = QMessageBox.question(
-                self,
-                "Mask polygon outside DEM",
-                "CAUTION: the mask polygon is outside the DEM. Do you still wish to continue?",
-                enum_member(QMessageBox, "StandardButton", "Yes") | enum_member(QMessageBox, "StandardButton", "No"),
-                enum_member(QMessageBox, "StandardButton", "No"),
-            )
-            if response == enum_member(QMessageBox, "StandardButton", "Yes"):
-                return True
-            self._remove_mask_layer_if_present()
-            self.status_label.setText("Compute cancelled. The mask layer was cleared.")
-            return False
-
-        # Case 2: the mask includes NoData cells. Create the red warning layer
-        # before asking whether to continue, so the user can review.
-        if nodata_cells > 0:
-            self._create_nodata_problem_layer(checker)
-            response = QMessageBox.question(
-                self,
-                "NoData values detected",
-                'WARNING: NoData values have been detected. This may output unrealistic results - please review the "NoData - problematic areas" layer. It is recommended to quality check the DEM. Do you still wish to continue?',
-                enum_member(QMessageBox, "StandardButton", "Yes") | enum_member(QMessageBox, "StandardButton", "No"),
-                enum_member(QMessageBox, "StandardButton", "No"),
-            )
-            if response == enum_member(QMessageBox, "StandardButton", "Yes"):
-                return True
-            self.status_label.setText('Compute cancelled. The mask layer was kept and the "NoData - problematic areas" layer was left for review.')
-            return False
-
-        self._remove_nodata_problem_layer_if_present()
-        return True
-
-    def _dem_nodata_warning_passed(self, dem_layer):
-        """Warns when an unmasked DEM contains NoData cells before Compute."""
-        # When a mask exists, _analysis_mask_warning_passed already checks the
-        # analysis-relevant NoData cells and shows the same warning. Avoid a
-        # duplicate whole-raster warning that would mostly show the DEM collar.
-        if self._mask_layer_is_available():
-            return True
-        checker = D8HydrologyEngine(
-            dem_layer,
-            lambda pct, msg: None,
-            self._abort_has_been_requested,
-            mask_layer=None,
-        )
-        try:
-            checker._read_dem(values=False, keep_nodata=True)
-            self._compute_memory_estimate = checker.memory_estimate()
-            has_nodata = bool(checker.nodata_cells.any())
-        except Exception:
-            return True
-        if not has_nodata:
-            self._remove_nodata_problem_layer_if_present()
-            return True
-        self._create_nodata_problem_layer(checker)
+    def _mask_outside_dem_passed(self):
+        """Asks whether to carry on with a mask polygon that misses the DEM; No clears the mask."""
         response = QMessageBox.question(
             self,
-            "NoData values detected",
-            'WARNING: NoData values have been detected. This may output unrealistic results - please review the "NoData - problematic areas" layer. It is recommended to quality check the DEM. Do you still wish to continue?',
+            "Mask polygon outside DEM",
+            "CAUTION: the mask polygon is outside the DEM. Do you still wish to continue?",
             enum_member(QMessageBox, "StandardButton", "Yes") | enum_member(QMessageBox, "StandardButton", "No"),
             enum_member(QMessageBox, "StandardButton", "No"),
         )
         if response == enum_member(QMessageBox, "StandardButton", "Yes"):
             return True
-        self.status_label.setText('Compute cancelled. The "NoData - problematic areas" layer was left for review.')
+        self._remove_mask_layer_if_present()
+        self.status_label.setText("Compute cancelled. The mask layer was cleared.")
         return False
+
+    def _nodata_warning_passed(self, dem_layer):
+        """Checks the mask polygon against the DEM and warns about NoData before Compute.
+
+        With a mask polygon every NoData cell inside it is reported. Without one,
+        only the NoData inside the data: narrow gaps, and holes with data all
+        round, not the NoData round the outside of it. The red layer is drawn
+        before the question, so the cells can be looked at while deciding whether
+        to fill the narrow gaps, and it stays for review.
+        """
+        mask = self.mask_layer if self._mask_layer_is_available() else None
+        if mask is not None and self._mask_is_definitely_outside_dem_extent(dem_layer):
+            return self._mask_outside_dem_passed()
+        checker = D8HydrologyEngine(
+            dem_layer,
+            lambda pct, msg: None,
+            self._abort_has_been_requested,
+            mask_layer=mask,
+        )
+        try:
+            info = checker.inspect_nodata()
+            self._compute_memory_estimate = checker.memory_estimate()
+        except HydrologyBuildError:
+            if mask is None:
+                return True
+            info = {
+                "mask_cells": int(checker.mask_raster_cell_count),
+                "valid_cells": int(checker.mask_cell_count),
+                "gap_cells": 0,
+                "other_cells": 0,
+            }
+        except Exception:
+            return True
+
+        # The mask does not capture any DEM cells or valid DEM cells. Kept apart
+        # from the NoData warning.
+        if mask is not None and (info["mask_cells"] <= 0 or info["valid_cells"] <= 0):
+            return self._mask_outside_dem_passed()
+
+        gap_cells, other_cells = info["gap_cells"], info["other_cells"]
+        if not gap_cells and not other_cells:
+            self._remove_nodata_problem_layer_if_present()
+            return True
+        self._create_nodata_problem_layer(checker, info, mask is not None)
+        answer, ticked = _ask(
+            self,
+            "NoData values detected",
+            NODATA_WARNING + "\n\n" + self._nodata_details(gap_cells, other_cells, mask is not None),
+            tick=("Fill narrow NoData gaps", self.fill_gaps_check.isChecked()) if gap_cells else None,
+        )
+        if answer == "yes":
+            if ticked is not None:
+                self.fill_gaps_check.setChecked(ticked)
+            return True
+        if mask is not None:
+            self.status_label.setText('Compute cancelled. The mask layer was kept and the "NoData - problematic areas" layer was left for review.')
+        else:
+            self.status_label.setText('Compute cancelled. The "NoData - problematic areas" layer was left for review.')
+        return False
+
+    @staticmethod
+    def _nodata_details(gap_cells, other_cells, has_mask):
+        """What the NoData check found, for the paragraph under the warning."""
+        parts = []
+        if gap_cells:
+            parts.append(
+                f"{gap_cells:,} NoData cells are in gaps up to {GAP_WIDTH} cells wide, such as seams between DEM "
+                "tiles. Tick Fill narrow NoData gaps below to fill them from the cells either side before routing, "
+                "so streams carry on across them; otherwise streams stop at them."
+            )
+        if other_cells:
+            more = "other " if gap_cells else ""
+            if has_mask:
+                parts.append(
+                    f"{other_cells:,} {more}NoData cells inside the mask polygon are in holes wider than {GAP_WIDTH} "
+                    "cells or beyond the edge of the data. They are never filled, and streams stop at their edge."
+                )
+            else:
+                parts.append(
+                    f"{other_cells:,} {more}NoData cells are in holes wider than {GAP_WIDTH} cells inside the data. "
+                    "They are never filled, and streams stop at their edge."
+                )
+        return "\n\n".join(parts)
 
     def _remove_nodata_problem_layer_if_present(self):
         """Removes stale NoData warning polygons created by this plugin."""
@@ -699,35 +856,55 @@ class DDMHydroLogicDock(QDockWidget):
                 log_ignored("interactive_dock._remove_nodata_problem_layer_if_present")
                 continue
 
-    def _create_nodata_problem_layer(self, checker):
-        """Creates a red temporary polygon layer over the NoData cells the checker found."""
+    def _create_nodata_problem_layer(self, checker, info, has_mask):
+        """Creates a red temporary polygon layer over the NoData cells the checker found.
+
+        Narrow gaps, which Fill narrow NoData gaps fills, are drawn lighter than
+        the NoData that stays.
+        """
         try:
             self._remove_nodata_problem_layer_if_present()
             if getattr(checker, "geotransform", None) is None:
                 return
-            geom = checker.nodata_geometry()
-            if geom is None or geom.isNull() or geom.isEmpty():
+            geoms = checker.nodata_geometries()
+            if not geoms:
                 return
-            crs_uri = checker._layer_crs_uri() if checker is not None else self._canvas_crs_uri()
-            layer = QgsVectorLayer(f"MultiPolygon?crs={crs_uri}", "NoData - problematic areas", "memory")
+            layer = QgsVectorLayer(
+                f"MultiPolygon?crs={checker._layer_crs_uri()}", "NoData - problematic areas", "memory"
+            )
             provider = layer.dataProvider()
-            provider.addAttributes([QgsField("warning", QVariant.String)])
+            provider.addAttributes([QgsField("warning", QVariant.String), QgsField("cells", QVariant.LongLong)])
             layer.updateFields()
-            feat = QgsFeature(layer.fields())
-            feat.setGeometry(geom)
-            feat.setAttributes(["NoData cells in the analysis area"])
-            provider.addFeatures([feat])
+            other_label = "NoData inside the mask polygon" if has_mask else "NoData inside the data"
+            labels = {1: (GAP_LABEL, info["gap_cells"]), 2: (other_label, info["other_cells"])}
+            features = []
+            for kind, geom in geoms.items():
+                if not geom.isMultipart():
+                    geom.convertToMultiType()
+                feat = QgsFeature(layer.fields())
+                feat.setGeometry(geom)
+                feat.setAttributes(list(labels[kind]))
+                features.append(feat)
+            provider.addFeatures(features)
             layer.updateExtents()
-            symbol = QgsFillSymbol.createSimple({
+            gap_symbol = QgsFillSymbol.createSimple({
+                "color": "255,0,0,35",
+                "outline_color": "255,0,0",
+                "outline_width": "0.50",
+            })
+            other_symbol = QgsFillSymbol.createSimple({
                 "color": "255,0,0,90",
                 "outline_color": "255,0,0",
                 "outline_width": "0.90",
             })
-            layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+            layer.setRenderer(QgsCategorizedSymbolRenderer("warning", [
+                QgsRendererCategory(GAP_LABEL, gap_symbol, GAP_LABEL),
+                QgsRendererCategory(other_label, other_symbol, other_label),
+            ]))
             QgsProject.instance().addMapLayer(layer)
             self.canvas.refresh()
         except Exception:
-            return
+            log_ignored("interactive_dock._create_nodata_problem_layer")
 
     def build_flow_paths(self):
         dem_layer = self.selected_dem_layer()
@@ -739,21 +916,18 @@ class DDMHydroLogicDock(QDockWidget):
             return
 
         self._compute_memory_estimate = None
-        if not self._analysis_mask_warning_passed(dem_layer):
-            return
-
-        if not self._dem_nodata_warning_passed(dem_layer):
+        if not self._nodata_warning_passed(dem_layer):
             return
 
         if not self._memory_warning_passed():
             return
 
-        min_acc = int(self.min_acc_spin.value())
+        min_area = int(self.min_area_spin.value())
         self.abort_requested = False
         self.active_operation = "build"
         self._set_busy(True)
         try:
-            self._remove_all_plugin_temporary_layers(include_flow=True)
+            self._remove_all_plugin_temporary_layers(include_flow=True, include_nodata=False)
             self._remove_layer_if_present("flow_layer")
             self._remove_layer_if_present("highlight_layer")
             self._remove_layer_if_present("subcatchment_layer")
@@ -771,24 +945,33 @@ class DDMHydroLogicDock(QDockWidget):
                 self._progress,
                 self._abort_has_been_requested,
                 mask_layer=mask_layer,
+                fill_gaps=self.fill_gaps_check.isChecked(),
             )
             self.engine.build()
 
             valid_count = self.engine.valid_count
+            min_acc = self.engine.cells_for_area_m2(min_area)
             feature_count = self.engine.flow_feature_count(min_acc)
             if feature_count > 750000:
-                response = QMessageBox.question(
+                suggested, suggested_count = self.engine.area_for_segment_count(300000)
+                suggested = min(suggested, MAX_DISPLAY_AREA)
+                answer, _ticked = _ask(
                     self,
                     "Large flow-path layer",
-                    f"This will create {feature_count:,} cell-size flow-path features.\n\n"
+                    f"This will create {feature_count:,} cell-size flow-path features. "
+                    f"An area of {suggested:,} m2 in 2. Display flow paths from area (m2) would create "
+                    f"{suggested_count:,}.\n\n"
                     "QGIS can do it, but it may become sluggish. Continue anyway?",
-                    enum_member(QMessageBox, "StandardButton", "Yes") | enum_member(QMessageBox, "StandardButton", "No"),
-                    enum_member(QMessageBox, "StandardButton", "No"),
+                    extra=f"Use {suggested:,} m2",
                 )
-                if response != enum_member(QMessageBox, "StandardButton", "Yes"):
+                if answer == "extra":
+                    self.min_area_spin.setValue(suggested)
+                    min_area = suggested
+                    min_acc = self.engine.cells_for_area_m2(min_area)
+                elif answer != "yes":
                     self.status_label.setText(
                         "Flow graph built, but the flow-path layer was not created. Increase 2. Display flow paths "
-                        "from flow accumulation and press 4. Compute again."
+                        f"from area (m2), for example to {suggested:,} m2, and press 4. Compute again."
                     )
                     return
 
@@ -799,10 +982,13 @@ class DDMHydroLogicDock(QDockWidget):
                 if getattr(self.engine, "mask_cell_count", 0) else
                 " Mask polygon: not used."
             )
+            filled = self.engine.filled_cell_count
+            filled_text = f" Filled {filled:,} cells in narrow NoData gaps." if filled else ""
             self.status_label.setText(
                 f"Flow graph ready. Valid DEM cells: {valid_count:,}. "
-                f"Displayed flow-path features: {flow_layer.featureCount():,}."
-                f"{mask_text} "
+                f"Displayed flow-path features: {flow_layer.featureCount():,}, from {min_area:,} m2 "
+                f"({min_acc:,} cells) upstream."
+                f"{mask_text}{filled_text} "
                 f"Cell size: {self.engine.cell_width:g} x {self.engine.cell_height:g} map units. "
                 f"Minimum preview unit: {self.engine.cell_area:g} m² per DEM cell."
             )
@@ -855,9 +1041,11 @@ class DDMHydroLogicDock(QDockWidget):
         return (
             self.refresh_btn,
             self.dem_combo,
-            self.min_acc_spin,
+            self.min_area_spin,
             self.mask_btn,
+            self.mask_layer_btn,
             self.build_btn,
+            self.fill_gaps_check,
             self.click_btn,
             self.clear_btn,
             self.draw_btn,
@@ -926,8 +1114,10 @@ class DDMHydroLogicDock(QDockWidget):
 
         self.refresh_btn.setEnabled(True)
         self.dem_combo.setEnabled(True)
-        self.min_acc_spin.setEnabled(True)
+        self.min_area_spin.setEnabled(True)
+        self.fill_gaps_check.setEnabled(True)
         self._gate(self.mask_btn, has_dem, need_dem)
+        self._gate(self.mask_layer_btn, has_dem, need_dem)
         self._gate(self.build_btn, has_dem, need_dem)
 
         self._gate(self.click_btn, has_flow, need_flow)
@@ -1003,7 +1193,7 @@ class DDMHydroLogicDock(QDockWidget):
             if ctrl_left:
                 removed_cells = self._deselect_catchment_group(cell_id)
                 action_text = (
-                    f"Deselected highlighted catchment {cell_id}. Removed {removed_cells:,} DEM cells "
+                    f"Deselected highlighted catchment {self.engine.raster_cell(cell_id)}. Removed {removed_cells:,} DEM cells "
                     "and their displayed upstream flow-path highlights."
                 )
             else:
@@ -1016,7 +1206,7 @@ class DDMHydroLogicDock(QDockWidget):
                 merged_text = ""
                 if after_groups < before_groups:
                     merged_text = " Overlapping child catchment(s) were merged into their downstream parent catchment."
-                action_text = f"Selected cell {cell_id}. This click added/updated {len(upstream_cells):,} upstream DEM cells.{merged_text}"
+                action_text = f"Selected cell {self.engine.raster_cell(cell_id)}. This click added/updated {len(upstream_cells):,} upstream DEM cells.{merged_text}"
 
             highlight = self._refresh_selection_outputs()
             displayed_highlight_count = highlight.featureCount() if highlight is not None else 0
@@ -1532,8 +1722,8 @@ class DDMHydroLogicDock(QDockWidget):
                                 continue
                             if not fgeom.intersects(geom):
                                 continue
-                            cid = int(feat["cell_id"])
-                            if cid not in seen:
+                            cid = self.engine.grid_cell(feat["cell_id"])
+                            if cid >= 0 and cid not in seen:
                                 seen.add(cid)
                                 cells.append(cid)
                         except Exception:
@@ -2116,7 +2306,7 @@ class DDMHydroLogicDock(QDockWidget):
         delete_ids = []
         for feat in layer.getFeatures():
             try:
-                cell_id = int(feat["cell_id"])
+                cell_id = self.engine.grid_cell(feat["cell_id"])
                 if not (0 <= cell_id < inside.size and inside[cell_id]):
                     delete_ids.append(int(feat.id()))
             except Exception:
@@ -2545,16 +2735,19 @@ class DDMHydroLogicDock(QDockWidget):
                     self._catchment_geom_cache = {}
                     self._clear_selection_polygon_overlay()
                     self._clear_outlet_line_overlay()
-                    QTimer.singleShot(0, lambda: self._remove_all_plugin_temporary_layers(include_flow=False, include_highlight=True, include_subcatchments=True))
+                    QTimer.singleShot(0, lambda: self._remove_all_plugin_temporary_layers(
+                        include_flow=False, include_highlight=True, include_subcatchments=True, include_nodata=False))
         QTimer.singleShot(0, self._refresh_step_gating)
 
-    def _remove_all_plugin_temporary_layers(self, include_flow=False, include_highlight=True, include_subcatchments=True):
+    def _remove_all_plugin_temporary_layers(self, include_flow=False, include_highlight=True,
+                                            include_subcatchments=True, include_nodata=True):
         """Removes stale DDM temporary layers by name, including stale ghost outputs."""
         prefixes = []
         if include_flow:
             prefixes.append("DDM HydroLogic flow paths")
         if include_highlight:
             prefixes.append("DDM HydroLogic upstream highlight")
+        if include_highlight and include_nodata:
             prefixes.append("NoData - problematic areas")
             prefixes.append("DDM HydroLogic mask NoData warning")
         if include_subcatchments:

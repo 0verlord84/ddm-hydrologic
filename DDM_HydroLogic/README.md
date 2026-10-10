@@ -8,6 +8,10 @@
 3. Faster - computing flow paths is about 4 times faster than v2.3, processing subcatchments 10 to 100 times faster (more on larger DEMs), and clicking flow paths and exporting several times faster. The n. of subcatchments and minimum size modes give the same subcatchments as v2.3.
 4. Large DEMs - Compute reads only the DEM around the mask polygon and needs about a sixth of the memory v2.3 did, so a 1 m DEM with tens of millions of cells inside the mask runs on an ordinary PC. Compute warns before it starts when the area needs more memory than is free, and running out of memory gives a plain message.
 5. QGIS 3.22 - exporting to GeoPackage no longer freezes QGIS.
+6. NoData gaps - before Compute starts, the NoData inside the data is drawn in red ("NoData - problematic areas", kept for review), and gaps up to 5 cells wide, such as seams between DEM tiles, can be filled from the cells either side so streams carry on across them (Fill narrow NoData gaps, ticked by default). Without a mask, the NoData round the outside of the data no longer brings up the warning.
+7. Step 2 is an area - 2. Display flow paths from area (m2), default 250,000 m2. The large flow-path layer warning gives the area that draws about 300,000 segments and can use it straight away.
+8. Use layer - the mask polygon can come from a polygon layer already in the project, all of it or the selected features.
+9. Catchment slope - where several cells share a subcatchment's top elevation, the profile starts from the one furthest up the flow path.
 
 **v2.3:**
 1. Subcatchments breakdown - This function invokes a window to further enhance the subcatchment delineation. Three possible ways: based on n. of subcatchments, minimum subcatchment size in pixel/m2/km2/ha, or Strahler order. A summary table is displayed to select, identify on map and review them.
@@ -90,7 +94,7 @@ frame at the top splits the catchment three ways:
   into it; a leftover with nothing above it, such as a small flow path the outlet
   line crosses, stays. The highest
   order gives one subcatchment per outlet, and the window warns when it is
-  selected. Strahler order only exists on the flow paths the step-2 accumulation
+  selected. Strahler order only exists on the flow paths the step-2 area
   threshold displays, so the window shows the highest order available.
 
 **Breaklines** lets you draw lines across flow paths where a subcatchment boundary

@@ -47,6 +47,7 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
+from .catchment_geometry import features_by_outlet
 from .compat import enum_member, log_ignored
 
 # QVariant type plus the memory-provider type name for each field kind.
@@ -119,13 +120,7 @@ def _subcatchment_features_by_outlet(engine) -> Dict[int, object]:
         raise TuflowExportError(
             "No valid subcatchment layer is available. Process subcatchments in 7. Subcatchments breakdown first."
         )
-    features: Dict[int, object] = {}
-    for feat in layer.getFeatures():
-        try:
-            features[int(feat["outlet_id"])] = feat
-        except Exception:
-            log_ignored("tuflow_exporter._subcatchment_features_by_outlet")
-            continue
+    features = features_by_outlet(engine, layer, "tuflow_exporter._subcatchment_features_by_outlet")
     if not features:
         raise TuflowExportError(
             "The subcatchment layer contains no outlet_id features to convert."

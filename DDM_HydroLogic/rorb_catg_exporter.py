@@ -24,7 +24,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 from qgis.core import QgsPointXY
 
-from .catchment_geometry import downstream_outlet_map, downstream_path, subarea_metrics
+from .catchment_geometry import downstream_outlet_map, downstream_path, features_by_outlet, subarea_metrics
 from .compat import log_ignored
 
 
@@ -103,14 +103,7 @@ def _subcatchment_features_by_outlet(engine) -> Dict[int, object]:
     layer = getattr(engine, "subcatchment_layer", None)
     if layer is None or not layer.isValid():
         raise RorbCatgExportError("No valid subcatchment layer is available. Process subcatchments in 7. Subcatchments breakdown first.")
-    result: Dict[int, object] = {}
-    for feat in layer.getFeatures():
-        try:
-            outlet_id = int(feat["outlet_id"])
-        except Exception:
-            log_ignored("rorb_catg_exporter._subcatchment_features_by_outlet")
-            continue
-        result[outlet_id] = feat
+    result = features_by_outlet(engine, layer, "rorb_catg_exporter._subcatchment_features_by_outlet")
     if not result:
         raise RorbCatgExportError("The subcatchment layer contains no outlet_id features to convert.")
     return result

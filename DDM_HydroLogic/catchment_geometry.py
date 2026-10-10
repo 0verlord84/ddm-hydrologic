@@ -204,13 +204,58 @@ def equal_area_slope(engine, path: List[int]) -> float:
     return max(2.0 * area / (length * length), SLOPE_FLOOR)
 
 
-def highest_cell(engine, cells) -> int:
-    """The subarea's highest cell on the pit-filled surface, the lowest cell id on a tie."""
+def flow_lengths(engine, cells, outlet_cell: int) -> List[float]:
+    """Distance in metres along the flow path from each cell down to ``outlet_cell``.
+
+    Paths that share their lower reaches are measured once. A cell whose path
+    never reaches the outlet gets -1.
+    """
+    downstream = getattr(engine, "downstream", None)
+    limit = len(downstream) if downstream is not None else 0
+    known: Dict[int, float] = {int(outlet_cell): 0.0}
+    lengths: List[float] = []
+    for cell in cells:
+        path: List[int] = []
+        current = int(cell)
+        while current not in known and len(path) <= limit:
+            path.append(current)
+            try:
+                current = int(downstream[current])
+            except Exception:
+                current = -1
+            if current < 0:
+                break
+        if known.get(current, -1.0) >= 0:
+            total = known[current]
+            for step in reversed(path):
+                total += cell_distance(engine, step, current)
+                known[step] = total
+                current = step
+        else:
+            for step in path:
+                known[step] = -1.0
+        lengths.append(known[int(cell)])
+    return lengths
+
+
+def highest_cell(engine, cells, outlet_cell: int) -> int:
+    """The subarea's highest cell on the pit-filled surface.
+
+    Where several cells share the top elevation, the one furthest from the
+    outlet along its flow path is taken, so the profile starts at the head of
+    the catchment; the lowest cell id if that ties too.
+    """
     surface = getattr(engine, "filled_dem", None)
     if isinstance(surface, np.ndarray) and isinstance(cells, np.ndarray):
         heights = surface.reshape(-1)[cells]
-        return int(cells[heights == heights.max()].min())
-    return int(min(cells, key=lambda c: (-elevation_of(engine, c), int(c))))
+        tied = np.sort(cells[heights == heights.max()]).tolist()
+    else:
+        top = max(elevation_of(engine, c) for c in cells)
+        tied = sorted(int(c) for c in cells if elevation_of(engine, c) == top)
+    if len(tied) == 1:
+        return int(tied[0])
+    lengths = [round(length, 6) for length in flow_lengths(engine, tied, outlet_cell)]
+    return int(tied[max(range(len(tied)), key=lambda i: (lengths[i], -i))])
 
 
 def catchment_profile(engine, outlet_cell: int, cells) -> List[int]:
@@ -221,7 +266,7 @@ def catchment_profile(engine, outlet_cell: int, cells) -> List[int]:
     """
     if cells is None or not len(cells):
         return [int(outlet_cell)]
-    high_cell = highest_cell(engine, cells)
+    high_cell = highest_cell(engine, cells, outlet_cell)
     path = downstream_path(engine, int(high_cell), int(outlet_cell))
     if not path:
         return [int(outlet_cell)]
@@ -393,6 +438,21 @@ class _Members:
 
     def __contains__(self, cell) -> bool:
         return self.owners.of(int(cell)) == self.outlet
+
+
+def features_by_outlet(engine, layer, context: str) -> Dict[int, object]:
+    """The subcatchment layer's features keyed by outlet cell.
+
+    The layer's ``outlet_id`` holds the cell number on the whole DEM; the key is
+    the engine's own id for that cell, the one the assignments use.
+    """
+    features: Dict[int, object] = {}
+    for feat in layer.getFeatures():
+        try:
+            features[engine.grid_cell(feat["outlet_id"])] = feat
+        except Exception:
+            log_ignored(context)
+    return features
 
 
 def _fingerprint(cells):

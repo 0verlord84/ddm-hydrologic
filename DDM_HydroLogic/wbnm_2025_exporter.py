@@ -32,7 +32,7 @@ from typing import Dict, Iterable, List, Tuple
 
 from qgis.core import QgsGeometry, QgsProject
 
-from .catchment_geometry import downstream_outlet_map
+from .catchment_geometry import downstream_outlet_map, features_by_outlet
 from .compat import log_ignored
 
 # Two blank lines separate every block; field width is 12 characters.
@@ -89,13 +89,7 @@ def _subcatchment_features_by_outlet(engine) -> Dict[int, object]:
         raise Wbnm2025ExportError(
             "No valid subcatchment layer is available. Process subcatchments in 7. Subcatchments breakdown first."
         )
-    features: Dict[int, object] = {}
-    for feat in layer.getFeatures():
-        try:
-            features[int(feat["outlet_id"])] = feat
-        except Exception:
-            log_ignored("wbnm_2025_exporter._subcatchment_features_by_outlet")
-            continue
+    features = features_by_outlet(engine, layer, "wbnm_2025_exporter._subcatchment_features_by_outlet")
     if not features:
         raise Wbnm2025ExportError(
             "The subcatchment layer contains no outlet_id features to convert."

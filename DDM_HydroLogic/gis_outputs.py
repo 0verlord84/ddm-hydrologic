@@ -36,7 +36,7 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
-from .catchment_geometry import dissolved_reaches, subarea_metrics
+from .catchment_geometry import dissolved_reaches, features_by_outlet, subarea_metrics
 from .compat import enum_member, log_ignored
 
 CENTROIDS = "Centroids"
@@ -240,13 +240,7 @@ def write_model_gis_outputs(
     if layer is None or not layer.isValid():
         raise GisOutputError("No valid subcatchment layer is available for the GIS outputs.")
 
-    features: Dict[int, object] = {}
-    for feat in layer.getFeatures():
-        try:
-            features[int(feat["outlet_id"])] = feat
-        except Exception:
-            log_ignored("gis_outputs.write_model_gis_outputs")
-            continue
+    features = features_by_outlet(engine, layer, "gis_outputs.write_model_gis_outputs")
 
     outlets = [int(o) for o in model_ids if int(o) in features]
     if not outlets:

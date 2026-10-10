@@ -29,7 +29,7 @@ import math
 import os
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from .catchment_geometry import SLOPE_FLOOR, downstream_outlet_map, subarea_metrics
+from .catchment_geometry import SLOPE_FLOOR, downstream_outlet_map, features_by_outlet, subarea_metrics
 from .compat import log_ignored
 
 # Written verbatim as the routing-file header; these are model defaults the
@@ -58,13 +58,7 @@ def _subcatchment_features_by_outlet(engine) -> Dict[int, object]:
         raise UrbsExportError(
             "No valid subcatchment layer is available. Process subcatchments in 7. Subcatchments breakdown first."
         )
-    features: Dict[int, object] = {}
-    for feat in layer.getFeatures():
-        try:
-            features[int(feat["outlet_id"])] = feat
-        except Exception:
-            log_ignored("urbs_exporter._subcatchment_features_by_outlet")
-            continue
+    features = features_by_outlet(engine, layer, "urbs_exporter._subcatchment_features_by_outlet")
     if not features:
         raise UrbsExportError(
             "The subcatchment layer contains no outlet_id features to convert."

@@ -54,7 +54,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import QgsCoordinateTransform, QgsFeature, QgsGeometry, QgsProject, QgsWkbTypes
 from qgis.gui import QgsRubberBand
 
-from .catchment_geometry import channel_slopes, downstream_outlet_map, upstream_area_ha
+from .catchment_geometry import channel_slopes, downstream_outlet_map, features_by_outlet, upstream_area_ha
 from .compat import enum_member, failure_text, log_ignored, qt_enum
 from .hydrology_engine import HydrologyCancelled
 
@@ -121,7 +121,7 @@ class BreakdownDialog(QDialog):
         self.dirty = False
         self.pending_settings = None
         self.whole_dem_accepted = False
-        self.notes = self._notes_from_layer(live)
+        self.notes = self._notes_from_layer(self.engine, live)
         self.highlight_band = None
         self._loading = False
         self._finished = False
@@ -177,7 +177,7 @@ class BreakdownDialog(QDialog):
             "Every stream of this order becomes one subcatchment with everything that drains into it. "
             "The area draining straight into higher-order streams is cut into pieces of about the "
             "average size of those subcatchments. The highest order gives one subcatchment per outlet. "
-            "Strahler order only exists on the flow paths the accumulation threshold displays, so a "
+            "Strahler order only exists on the flow paths the step-2 area threshold displays, so a "
             "coarse threshold leaves fewer orders."
         )
         process_layout.addLayout(self._mode_row(self.strahler_radio, [self.strahler_spin, self.order_hint],
@@ -239,8 +239,8 @@ class BreakdownDialog(QDialog):
         if not self.orders:
             self.strahler_radio.setEnabled(False)
             self.strahler_radio.setToolTip(
-                "No Strahler orders are available. Lower the display flow-path accumulation "
-                "threshold in step 2 and compute the flow paths again."
+                "No Strahler orders are available. Lower the area in 2. Display flow paths from area (m2) "
+                "and compute the flow paths again."
             )
 
         for radio in (self.count_radio, self.area_radio, self.strahler_radio):
@@ -435,7 +435,7 @@ class BreakdownDialog(QDialog):
         return rows
 
     @staticmethod
-    def _notes_from_layer(layer):
+    def _notes_from_layer(engine, layer):
         notes = {}
         if layer is None or layer.fields().indexOf("label") < 0:
             return notes
@@ -443,7 +443,7 @@ class BreakdownDialog(QDialog):
             try:
                 text = feat["label"]
                 if text:
-                    notes[int(feat["outlet_id"])] = str(text)
+                    notes[engine.grid_cell(feat["outlet_id"])] = str(text)
             except Exception:
                 log_ignored("breakdown_dialog._notes_from_layer")
         return notes
@@ -517,13 +517,7 @@ class BreakdownDialog(QDialog):
 
         QApplication.setOverrideCursor(qt_enum(Qt, "CursorShape", "WaitCursor"))
         try:
-            features = {}
-            for feat in layer.getFeatures():
-                try:
-                    features[int(feat["outlet_id"])] = feat
-                except Exception:
-                    log_ignored("breakdown_dialog.reload_table")
-                    continue
+            features = features_by_outlet(self.engine, layer, "breakdown_dialog.reload_table")
 
             outlets = [int(o) for o in assignments if int(o) in features]
             id_of = self.engine.apply_breakdown_ids(layer, assignments, self.dock.outlet_cells, self.notes)

@@ -56,6 +56,14 @@ if hasattr(gdal, "GDT_Int8"):
 # Cells the priority flood takes off its queue between progress updates.
 _FLOOD_STEP = 65536
 
+# Widest NoData gap, in cells, that Fill narrow NoData gaps fills. Where two
+# seams cross, the crossing only closes once the seams either side are filled,
+# so the search runs again with filled cells counting as data, up to this many
+# times. The window round a mask polygon is wide enough for every search.
+GAP_WIDTH = 5
+_GAP_PASSES = 3
+_WINDOW_MARGIN = 2 + GAP_WIDTH * _GAP_PASSES
+
 # Peak memory of Compute and the processing after it, measured on a 1 m DEM: a
 # fixed part, bytes per cell of the processing window on top of the elevation
 # itself, and bytes per valid cell.
@@ -116,6 +124,40 @@ def _float_values(bits):
     return bits.view(kind)
 
 
+def _round_up(value, figures=2):
+    """A positive number rounded up to a whole number with at most ``figures`` significant figures."""
+    if value <= 0:
+        return 0
+    scale = 10 ** max(0, int(math.floor(math.log10(value))) - figures + 1)
+    return int(math.ceil(value / scale - 1e-9) * scale)
+
+
+def _gap_runs(known, axis):
+    """Unknown cells in a run of at most GAP_WIDTH unknown cells along ``axis``, with known cells at both ends."""
+    length = known.shape[axis]
+    before = np.zeros(known.shape, dtype=np.int8)
+    after = np.zeros(known.shape, dtype=np.int8)
+    for step in range(1, min(GAP_WIDTH, length - 1) + 1):
+        head = (slice(None),) * axis + (slice(step, None),)
+        tail = (slice(None),) * axis + (slice(None, length - step),)
+        np.copyto(before[head], step, where=(before[head] == 0) & known[tail])
+        np.copyto(after[tail], step, where=(after[tail] == 0) & known[head])
+    return (before > 0) & (after > 0) & (before + after <= GAP_WIDTH + 1) & ~known
+
+
+def _run_ends(known, rows, cols, d_row, d_col):
+    """Steps from each cell to the nearest known cell in one direction, up to GAP_WIDTH; 0 if there is none."""
+    found = np.zeros(rows.size, dtype=np.int8)
+    height, width = known.shape
+    for step in range(1, GAP_WIDTH + 1):
+        r, c = rows + d_row * step, cols + d_col * step
+        look = (found == 0) & (r >= 0) & (r < height) & (c >= 0) & (c < width)
+        hit = np.zeros(rows.size, dtype=bool)
+        hit[look] = known[r[look], c[look]]
+        found[hit] = step
+    return found
+
+
 class _UpstreamCells:
     """``get(cell)`` gives the valid cells draining straight into a cell, lowest id first.
 
@@ -139,7 +181,7 @@ class _UpstreamCells:
 class D8HydrologyEngine:
     """Build and query a D8 flow graph from a north-up raster DEM."""
 
-    def __init__(self, dem_layer, progress_callback=None, cancel_callback=None, mask_layer=None):
+    def __init__(self, dem_layer, progress_callback=None, cancel_callback=None, mask_layer=None, fill_gaps=False):
         self.dem_layer = dem_layer
         self.progress_callback = progress_callback or (lambda _pct, _msg: None)
         self.cancel_callback = cancel_callback or (lambda: False)
@@ -149,14 +191,21 @@ class D8HydrologyEngine:
         self.mask_cell_count = 0
         self.mask_raster_cell_count = 0
         self.mask_nodata_cell_count = 0
-        self.nodata_cells = None
+        # NoData gaps up to GAP_WIDTH cells wide are filled before routing when set.
+        self.fill_gaps = bool(fill_gaps)
+        self.filled_cell_count = 0
+        # The NoData the preflight checks report: 1 in a narrow gap, 2 elsewhere.
+        self.nodata_kinds = None
 
         self.dataset_path = None
         self.geotransform = None
         self.projection = None
+        self.raster_rows = 0
+        self.raster_cols = 0
         # The grid is the processing window with a frame of invalid cells one cell
         # wide all round. Grid row 0 is raster row ``row_offset``, and a cell id
-        # is ``row * cols + col`` on the grid.
+        # is ``row * cols + col`` on the grid. The layers carry cell numbers on the
+        # whole raster instead, which stay the same whatever the window.
         self.rows = 0
         self.cols = 0
         self.row_offset = 0
@@ -229,8 +278,9 @@ class D8HydrologyEngine:
 
         With a mask polygon only the raster rows and columns around it are read,
         otherwise the whole raster. ``values`` False keeps the valid-cell mask
-        only, which is all the preflight checks use, and ``keep_nodata`` keeps the
-        mask of the NoData cells they report.
+        only, which is all the preflight checks use, and ``keep_nodata`` marks the
+        NoData cells they report. With ``fill_gaps`` set, narrow NoData gaps are
+        filled before the mask polygon is applied.
         """
         self._emit(2, "Reading DEM")
         uri = self.dem_layer.dataProvider().dataSourceUri()
@@ -255,6 +305,7 @@ class D8HydrologyEngine:
 
         self.geotransform = gt
         self.projection = ds.GetProjection()
+        self.raster_rows, self.raster_cols = int(ds.RasterYSize), int(ds.RasterXSize)
         self.cell_width = abs(float(gt[1]))
         self.cell_height = abs(float(gt[5]))
         self.cell_area = self.cell_width * self.cell_height
@@ -291,18 +342,25 @@ class D8HydrologyEngine:
                 dem[1 + start:1 + start + height, 1:-1] = block
         ds = None
 
+        filling = self.fill_gaps and dem is not None
+        if keep_nodata or filling:
+            self._emit(12, "Looking for narrow NoData gaps")
+            passes = self._narrow_gaps(valid)
+            if keep_nodata:
+                self.nodata_kinds = self._nodata_kinds(valid, passes, burned)
+            if filling and passes.any():
+                self._fill_gaps(dem, valid, passes)
+                filled = passes > 0
+                if burned is not None:
+                    filled &= burned
+                self.filled_cell_count = int(np.count_nonzero(filled))
+            del passes
+
         if burned is not None:
             self.mask_raster_cell_count = int(np.count_nonzero(burned))
-            missing = burned & ~valid
-            self.mask_nodata_cell_count = int(np.count_nonzero(missing))
+            self.mask_nodata_cell_count = int(np.count_nonzero(burned & ~valid))
             valid &= burned
             self.mask_cell_count = int(np.count_nonzero(valid))
-        elif keep_nodata:
-            missing = ~valid
-            missing[0, :] = missing[-1, :] = False
-            missing[:, 0] = missing[:, -1] = False
-        if keep_nodata:
-            self.nodata_cells = missing
         if burned is not None and self.mask_cell_count <= 0:
             raise HydrologyBuildError("The mask polygon does not overlaps with any valid DEM cells.")
 
@@ -360,9 +418,13 @@ class D8HydrologyEngine:
                 return burned
             window = full
 
-    def _mask_window(self, raster_rows, raster_cols, mask_geom, margin=2):
+    def _mask_window(self, raster_rows, raster_cols, mask_geom, margin=_WINDOW_MARGIN):
         """Raster rows and columns ``(row0, row1, col0, col1)`` round the mask polygon,
-        or None when it misses the raster."""
+        or None when it misses the raster.
+
+        The margin leaves room for the narrow-gap search on either side of the
+        polygon, so a gap inside it is found the same way the whole DEM would find it.
+        """
         gt = self.geotransform
         box = mask_geom.boundingBox()
         cols = sorted(((box.xMinimum() - gt[0]) / gt[1], (box.xMaximum() - gt[0]) / gt[1]))
@@ -376,6 +438,26 @@ class D8HydrologyEngine:
         if col1 <= col0 or row1 <= row0:
             return None
         return row0, row1, col0, col1
+
+    def raster_cells(self, cells):
+        """Cell numbers on the whole DEM, counted row by row from its top-left cell, for grid cell ids."""
+        cells = np.asarray(cells, dtype=np.int64)
+        return (cells // self.cols + self.row_offset) * self.raster_cols + cells % self.cols + self.col_offset
+
+    def raster_cell(self, cell):
+        return int(self.raster_cells(int(cell)))
+
+    def grid_cells(self, numbers):
+        """Grid cell ids for cell numbers on the whole DEM; -1 for any outside the processing window."""
+        numbers = np.asarray(numbers, dtype=np.int64)
+        row = numbers // max(1, self.raster_cols) - self.row_offset
+        col = numbers % max(1, self.raster_cols) - self.col_offset
+        inside = (numbers >= 0) & (row >= 0) & (row < self.rows) & (col >= 0) & (col < self.cols)
+        return np.where(inside, row * self.cols + col, -1)
+
+    def grid_cell(self, number):
+        """Grid cell id for a cell number on the whole DEM, as the layers carry it; -1 outside the window."""
+        return int(self.grid_cells(int(number)))
 
     def _grid_transform(self, row, col):
         """Geotransform of a block of the grid whose top-left cell is grid (row, col)."""
@@ -470,34 +552,146 @@ class D8HydrologyEngine:
         except Exception as exc:
             raise HydrologyBuildError(f"Could not rasterise the mask polygon: {exc}") from exc
 
-    def inspect_analysis_mask_quality(self):
-        """Returns a preflight summary of how the optional mask intersects the DEM.
+    def inspect_nodata(self):
+        """Preflight summary of the NoData Compute will meet, before the graph is built.
 
-        The dock uses this before full graph construction so the user can decide
-        whether to continue when the digitised mask touches NoData/outside cells.
+        Gives the cells the mask polygon covers and how many of them hold data, and
+        the NoData cells to report: with a mask polygon every one inside it,
+        without one those inside the data, narrow gaps and cells with data on all
+        four sides. ``gap_cells`` are the ones Fill narrow NoData gaps fills.
         """
-        if self.mask_layer is None:
-            return {"has_mask": False, "mask_cells": 0, "valid_cells": 0, "nodata_cells": 0}
         self._read_dem(values=False, keep_nodata=True)
+        kinds = self.nodata_kinds
+        gap_cells = int(np.count_nonzero(kinds == 1))
+        has_mask = self.mask_layer is not None
         return {
-            "has_mask": True,
+            "has_mask": has_mask,
             "mask_cells": int(self.mask_raster_cell_count),
-            "valid_cells": int(self.mask_cell_count),
-            "nodata_cells": int(self.mask_nodata_cell_count),
+            "valid_cells": int(self.mask_cell_count if has_mask else self.valid_count),
+            "gap_cells": gap_cells,
+            "other_cells": int(np.count_nonzero(kinds)) - gap_cells,
         }
 
-    def nodata_geometry(self):
-        """One dissolved polygon over the NoData cells kept by the last read."""
-        cells = self.nodata_cells
-        if cells is None or not cells.any():
-            return QgsGeometry()
-        rows = np.flatnonzero(cells.any(axis=1))
-        cols = np.flatnonzero(cells.any(axis=0))
+    def _narrow_gaps(self, valid):
+        """The search pass in which each NoData cell in a narrow gap is found, 0 for every other cell.
+
+        A narrow gap is a run of at most GAP_WIDTH NoData cells along a row or a
+        column with data at both ends, such as a seam between DEM tiles. Where two
+        seams cross, the crossing is only such a run once the seams either side
+        are filled, so the search is repeated with the cells found counting as
+        data. The NoData round the outside of the data never has data at both
+        ends of a short run, so it is never a gap.
+        """
+        rows, cols = valid.shape
+        passes = np.zeros((rows, cols), dtype=np.uint8)
+        if valid[1:-1, 1:-1].all():
+            return passes
+        known = valid.copy()
+        step = max(1, BLOCK // max(1, cols))
+        for number in range(1, _GAP_PASSES + 1):
+            found = False
+            for start in range(1, rows - 1, step):
+                self._check_cancelled()
+                stop = min(rows - 1, start + step)
+                if known[start:stop, 1:-1].all():
+                    continue
+                low, high = max(0, start - GAP_WIDTH), min(rows, stop + GAP_WIDTH)
+                slab = known[low:high]
+                core = slice(start - low, stop - low)
+                closed = _gap_runs(slab[core], 1) | _gap_runs(slab, 0)[core]
+                if closed.any():
+                    passes[start:stop][closed] = number
+                    found = True
+            if not found:
+                break
+            known |= passes == number
+        return passes
+
+    def _nodata_kinds(self, valid, passes, burned):
+        """Marks the NoData the preflight checks report: 1 in a narrow gap, 2 elsewhere.
+
+        With a mask polygon that is every NoData cell inside it. Without one it is
+        the narrow gaps and the cells with data somewhere to the left, right,
+        above and below them, not the NoData round the outside of the data.
+        """
+        gaps = passes > 0
+        if burned is not None:
+            other = burned & ~valid & ~gaps
+            gaps &= burned
+        else:
+            other = self._enclosed_nodata(valid)
+            other &= ~gaps
+        kinds = gaps.view(np.uint8)
+        kinds[other] = 2
+        return kinds
+
+    def _enclosed_nodata(self, valid):
+        """NoData cells with data somewhere to the left, right, above and below them in their row and column."""
+        rows, cols = valid.shape
+        step = max(1, BLOCK // max(1, cols))
+        enclosed = np.empty((rows, cols), dtype=bool)
+        seen = np.zeros(cols, dtype=bool)
+        for start in range(0, rows, step):
+            block = np.logical_or.accumulate(valid[start:start + step], axis=0)
+            block |= seen
+            enclosed[start:start + step] = block
+            seen = block[-1].copy()
+        seen[:] = False
+        for start in reversed(range(0, rows, step)):
+            self._check_cancelled()
+            block = valid[start:start + step]
+            below = np.logical_or.accumulate(block[::-1], axis=0)[::-1]
+            below |= seen
+            seen = below[0].copy()
+            left = np.logical_or.accumulate(block, axis=1)
+            right = np.logical_or.accumulate(block[:, ::-1], axis=1)[:, ::-1]
+            enclosed[start:start + step] &= below & left & right & ~block
+        return enclosed
+
+    @staticmethod
+    def _fill_gaps(dem, valid, passes):
+        """Fills the narrow gaps in place, in the order the search found them, and marks them valid.
+
+        Each cell takes the straight line between the data at either end of its
+        run along the row, or the column, or the mean of the two where both runs
+        are short enough.
+        """
+        for number in range(1, int(passes.max()) + 1):
+            rows, cols = np.nonzero(passes == number)
+            if not rows.size:
+                continue
+            total = np.zeros(rows.size)
+            count = np.zeros(rows.size)
+            for d_row, d_col in ((0, 1), (1, 0)):
+                before = _run_ends(valid, rows, cols, -d_row, -d_col)
+                after = _run_ends(valid, rows, cols, d_row, d_col)
+                short = (before > 0) & (after > 0) & (before + after <= GAP_WIDTH + 1)
+                if not short.any():
+                    continue
+                b = before[short].astype(np.int64)
+                a = after[short].astype(np.int64)
+                r, c = rows[short], cols[short]
+                start = dem[r - b * d_row, c - b * d_col].astype(np.float64)
+                end = dem[r + a * d_row, c + a * d_col].astype(np.float64)
+                total[short] += start + (end - start) * b / (b + a)
+                count[short] += 1
+            done = count > 0
+            dem[rows[done], cols[done]] = total[done] / count[done]
+            valid[rows[done], cols[done]] = True
+
+    def nodata_geometries(self):
+        """Outlines of the NoData cells the last preflight read marked, as ``{kind: QgsGeometry}``."""
+        kinds = self.nodata_kinds
+        if kinds is None or not kinds.any():
+            return {}
+        rows = np.flatnonzero(kinds.any(axis=1))
+        cols = np.flatnonzero(kinds.any(axis=0))
         r0, r1, c0, c1 = int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
-        parts = [geom for _value, geom in self._polygonize(cells[r0:r1, c0:c1].astype(np.uint8), r0, c0)]
-        if not parts:
-            return QgsGeometry()
-        return parts[0] if len(parts) == 1 else QgsGeometry.unaryUnion(parts)
+        parts = defaultdict(list)
+        for value, geom in self._polygonize(np.ascontiguousarray(kinds[r0:r1, c0:c1]), r0, c0):
+            parts[value].append(geom)
+        return {value: geoms[0] if len(geoms) == 1 else QgsGeometry.unaryUnion(geoms)
+                for value, geoms in sorted(parts.items())}
 
     def memory_estimate(self):
         """Approximate peak bytes Compute and processing need, for the window and valid cells of the last read."""
@@ -795,6 +989,31 @@ class D8HydrologyEngine:
             count += int(np.count_nonzero(keep))
         return count
 
+    def area_for_segment_count(self, target):
+        """Smallest display area, rounded up to two significant figures, that draws at most ``target`` segments.
+
+        Returns the area in square metres and the number of segments it draws.
+        """
+        valid = self.valid.reshape(-1)
+        keep = int(target) + 1
+        top = np.empty(0, dtype=self.accumulation.dtype)
+        floor = 0
+        for start in range(0, valid.size, BLOCK):
+            stop = min(valid.size, start + BLOCK)
+            acc = self.accumulation[start:stop]
+            values = acc[valid[start:stop] & (self.downstream[start:stop] >= 0) & (acc > floor)]
+            if not values.size:
+                continue
+            top = np.concatenate((top, values))
+            if top.size > keep:
+                top = np.partition(top, top.size - keep)[top.size - keep:]
+                floor = int(top.min())
+        # A segment is drawn from an accumulation of min_cells up, so one more than
+        # the accumulation of the (target + 1)th largest leaves target at most.
+        min_cells = int(top.min()) + 1 if top.size >= keep else 1
+        area = _round_up(min_cells * self.cell_area)
+        return area, self.flow_feature_count(self.cells_for_area_m2(area))
+
     def create_flow_layer(self, min_accumulation=1):
         """Creates a temporary line layer containing cell-to-cell flow segments."""
         self._emit(84, "Creating temporary flow-path line layer")
@@ -834,20 +1053,21 @@ class D8HydrologyEngine:
         features = []
         chunk_size = 25000
         total = max(1, candidates.size)
-        cols, row_offset, col_offset = self.cols, self.row_offset, self.col_offset
+        raster_cols = self.raster_cols
 
-        rows = zip(candidates.tolist(), receivers.tolist(), accumulation.tolist(), orders.tolist())
-        for idx, (cell_id, down_id, acc_cells, order) in enumerate(rows):
+        rows = zip(candidates.tolist(), receivers.tolist(), self.raster_cells(candidates).tolist(),
+                   self.raster_cells(receivers).tolist(), accumulation.tolist(), orders.tolist())
+        for idx, (cell_id, down_id, number, down_number, acc_cells, order) in enumerate(rows):
             if not idx & 4095:
                 self._check_cancelled()
             geom = QgsGeometry.fromPolylineXY([self.cell_center(cell_id), self.cell_center(down_id)])
             feat = QgsFeature(fields)
             feat.setGeometry(geom)
             feat.setAttributes([
-                cell_id,
-                cell_id // cols + row_offset,
-                cell_id % cols + col_offset,
-                down_id,
+                number,
+                number // raster_cols,
+                number % raster_cols,
+                down_number,
                 acc_cells,
                 order,
                 round(float(geom.length()), 2),
@@ -922,19 +1142,19 @@ class D8HydrologyEngine:
         if self.flow_layer is None:
             raise HydrologyBuildError("No temporary flow-path layer is available for export.")
 
-        cell_count = self.rows * self.cols
-        displayed_cells = set()
+        numbers = []
         for feat in self.flow_layer.getFeatures():
             self._check_cancelled()
             try:
-                cell_id = int(feat["cell_id"])
+                number = int(feat["cell_id"])
                 # A feature whose order does not read as a number is left out.
                 int(feat["strahler"])
             except Exception:
                 log_ignored("hydrology_engine.create_reach_flow_layer")
                 continue
-            if 0 <= cell_id < cell_count:
-                displayed_cells.add(cell_id)
+            numbers.append(number)
+        found = self.grid_cells(numbers)
+        displayed_cells = set(found[found >= 0].tolist())
         if not displayed_cells:
             raise HydrologyBuildError("The temporary flow-path layer contains no displayed flow paths to export.")
 
@@ -1049,8 +1269,8 @@ class D8HydrologyEngine:
             feat.setGeometry(geom)
             feat.setAttributes([
                 int(reach_id),
-                int(cells[0]),
-                int(cells[-1]),
+                self.raster_cell(cells[0]),
+                self.raster_cell(cells[-1]),
                 int(len(cells)),
                 int(self.accumulation[cells[0]]),
                 int(self.accumulation[cells[-1]]),
@@ -1087,14 +1307,18 @@ class D8HydrologyEngine:
         self.shown_cells = None
         if self.flow_layer is None:
             return
+        fids, numbers = [], []
         for feat in self.flow_layer.getFeatures():
             self.spatial_index.addFeature(feat)
-            cell_id = int(feat["cell_id"])
-            self.feature_to_cell[int(feat.id())] = cell_id
-            self.cell_to_feature[cell_id] = int(feat.id())
+            fids.append(int(feat.id()))
+            numbers.append(int(feat["cell_id"]))
+        cells = self.grid_cells(numbers)
+        for fid, cell_id in zip(fids, cells.tolist()):
+            if cell_id >= 0:
+                self.feature_to_cell[fid] = cell_id
+                self.cell_to_feature[cell_id] = fid
         shown = np.zeros(self.rows * self.cols, dtype=bool)
-        cells = np.fromiter(self.cell_to_feature.keys(), dtype=np.int64, count=len(self.cell_to_feature))
-        shown[cells[(cells >= 0) & (cells < shown.size)]] = True
+        shown[cells[cells >= 0]] = True
         self.shown_cells = shown
 
     def forget_flow_layer(self):
@@ -1306,8 +1530,8 @@ class D8HydrologyEngine:
         """Creates or refreshes a yellow line layer showing displayed upstream flow paths.
 
         The DEM graph may contain many more upstream cells than the temporary
-        flow-path layer displays when 2. Display flow paths from flow accumulation is
-        greater than 1. Highlights only cells that actually exist as output
+        flow-path layer displays when 2. Display flow paths from area (m2) is more
+        than one cell. Highlights only cells that actually exist as output
         flow-path features, otherwise the click tool draws hidden low-
         accumulation lines back into existence.
         """
@@ -1341,7 +1565,7 @@ class D8HydrologyEngine:
             feat = QgsFeature(layer.fields())
             feat.setGeometry(QgsGeometry.fromPolylineXY([self.cell_center(cell_id), self.cell_center(down_id)]))
             feat.setAttributes([
-                int(cell_id),
+                self.raster_cell(cell_id),
                 int(self.accumulation[cell_id]),
                 order if order >= 1 else 1,
             ])
@@ -1367,8 +1591,8 @@ class D8HydrologyEngine:
                 continue
             if not feat.geometry().intersects(line_geometry):
                 continue
-            cell_id = int(feat["cell_id"])
-            if cell_id not in seen:
+            cell_id = self.grid_cell(feat["cell_id"])
+            if cell_id >= 0 and cell_id not in seen:
                 seen.add(cell_id)
                 outlet_cells.append(cell_id)
         outlet_cells.sort(key=lambda c: int(self.accumulation[c]), reverse=True)
@@ -1572,7 +1796,7 @@ class D8HydrologyEngine:
         that mean is absorbed by dropping the smallest cut draining straight into
         it, repeated until it is big enough; a leftover with no such cut above it
         stays. Strahler order only exists on the displayed flow paths, so the
-        step-2 accumulation threshold sets which orders there are.
+        step-2 area threshold sets which orders there are.
 
         Returns the assignments and a summary: the size threshold in cells, the
         number of subcatchments built around streams of the chosen order, and the
@@ -1809,7 +2033,7 @@ class D8HydrologyEngine:
             # geometry stored in the attribute table.
             area_m2 = round(float(geom.area()), 2)
             feat.setAttributes([
-                int(outlet_id),
+                self.raster_cell(outlet_id),
                 int(len(cells)),
                 area_m2,
                 round(float(area_m2 / 10000.0), 2),
@@ -1859,7 +2083,7 @@ class D8HydrologyEngine:
         updates = {}
         for feat in layer.getFeatures():
             try:
-                outlet = int(feat["outlet_id"])
+                outlet = self.grid_cell(feat["outlet_id"])
             except Exception:
                 log_ignored("hydrology_engine.apply_breakdown_ids")
                 continue
