@@ -12,6 +12,7 @@
 import gc
 import os
 
+import numpy as np
 from qgis.PyQt import sip
 from qgis.PyQt.QtCore import Qt, QTimer, QVariant
 from qgis.PyQt.QtGui import QColor
@@ -52,7 +53,7 @@ from qgis.core import (
 )
 from qgis.gui import QgsMapToolEmitPoint, QgsRubberBand
 
-from .compat import enum_member, log_ignored, qt_enum
+from .compat import OUT_OF_MEMORY, enum_member, failure_text, free_memory_bytes, log_ignored, qt_enum
 from .breakdown_dialog import BreakdownDialog
 from .hydrology_engine import D8HydrologyEngine, HydrologyBuildError, HydrologyCancelled
 from .map_tools import DrawOutletLineTool, DrawMaskPolygonTool
@@ -95,11 +96,11 @@ class DDMHydroLogicDock(QDockWidget):
         self.mask_layer = None
         self.outlet_cells = []
         self.current_assignments = {}
-        self.selected_highlight_cells = set()
+        self.selected_cell_count = 0
         self.selected_catchment_groups = {}
-        self.selection_polygon_geom = None
         self.selection_polygon_bands = []
         self._catchment_geom_cache = {}
+        self._compute_memory_estimate = None
         self.outlet_line_band = None
         self.outlet_line_points = []
         self.outlet_line_layer_geom = None
@@ -394,9 +395,9 @@ class DDMHydroLogicDock(QDockWidget):
         self.engine = None
         self.outlet_cells = []
         self.current_assignments = {}
-        self.selected_highlight_cells = set()
+        self.selected_cell_count = 0
         self.selected_catchment_groups = {}
-        self.selection_polygon_geom = None
+        self._catchment_geom_cache = {}
         self._clear_selection_polygon_overlay()
         self._clear_outlet_line_overlay()
         gc.collect()
@@ -497,8 +498,9 @@ class DDMHydroLogicDock(QDockWidget):
             self.engine = None
             self.outlet_cells = []
             self.current_assignments = {}
-            self.selected_highlight_cells = set()
+            self.selected_cell_count = 0
             self.selected_catchment_groups = {}
+            self._catchment_geom_cache = {}
             self._clear_selection_polygon_overlay()
             self._clear_outlet_line_overlay()
 
@@ -602,12 +604,12 @@ class DDMHydroLogicDock(QDockWidget):
         )
         try:
             info = checker.inspect_analysis_mask_quality()
+            self._compute_memory_estimate = checker.memory_estimate()
         except HydrologyBuildError:
             info = {
                 "mask_cells": int(getattr(checker, "mask_raster_cell_count", 0) or 0),
                 "valid_cells": int(getattr(checker, "mask_cell_count", 0) or 0),
                 "nodata_cells": int(getattr(checker, "mask_nodata_cell_count", 0) or 0),
-                "nodata_cell_ids": list(getattr(checker, "mask_nodata_cell_ids", []) or []),
             }
         except Exception:
             return True
@@ -635,7 +637,7 @@ class DDMHydroLogicDock(QDockWidget):
         # Case 2: the mask includes NoData cells. Create the red warning layer
         # before asking whether to continue, so the user can review.
         if nodata_cells > 0:
-            self._create_nodata_problem_layer(checker, info)
+            self._create_nodata_problem_layer(checker)
             response = QMessageBox.question(
                 self,
                 "NoData values detected",
@@ -665,16 +667,15 @@ class DDMHydroLogicDock(QDockWidget):
             mask_layer=None,
         )
         try:
-            checker._read_dem()
-            flat_valid = checker.valid.reshape(-1)
-            nodata_cell_ids = [int(i) for i, ok in enumerate(flat_valid) if not bool(ok)]
+            checker._read_dem(values=False, keep_nodata=True)
+            self._compute_memory_estimate = checker.memory_estimate()
+            has_nodata = bool(checker.nodata_cells.any())
         except Exception:
             return True
-        if not nodata_cell_ids:
+        if not has_nodata:
             self._remove_nodata_problem_layer_if_present()
             return True
-        info = {"nodata_cell_ids": nodata_cell_ids}
-        self._create_nodata_problem_layer(checker, info)
+        self._create_nodata_problem_layer(checker)
         response = QMessageBox.question(
             self,
             "NoData values detected",
@@ -698,19 +699,15 @@ class DDMHydroLogicDock(QDockWidget):
                 log_ignored("interactive_dock._remove_nodata_problem_layer_if_present")
                 continue
 
-    def _create_nodata_problem_layer(self, checker, info):
-        """Creates a red temporary polygon layer over the given NoData cells."""
+    def _create_nodata_problem_layer(self, checker):
+        """Creates a red temporary polygon layer over the NoData cells the checker found."""
         try:
             self._remove_nodata_problem_layer_if_present()
-            geoms = []
-            cell_ids = [int(c) for c in info.get("nodata_cell_ids", []) or []]
-            if cell_ids and getattr(checker, "geotransform", None) is not None:
-                geom = checker.dissolve_cells_to_geometry(cell_ids)
-                if geom is not None and not geom.isNull() and not geom.isEmpty():
-                    geoms.append(geom)
-            if not geoms:
+            if getattr(checker, "geotransform", None) is None:
                 return
-            geom = geoms[0] if len(geoms) == 1 else QgsGeometry.unaryUnion(geoms)
+            geom = checker.nodata_geometry()
+            if geom is None or geom.isNull() or geom.isEmpty():
+                return
             crs_uri = checker._layer_crs_uri() if checker is not None else self._canvas_crs_uri()
             layer = QgsVectorLayer(f"MultiPolygon?crs={crs_uri}", "NoData - problematic areas", "memory")
             provider = layer.dataProvider()
@@ -741,10 +738,14 @@ class DDMHydroLogicDock(QDockWidget):
         if not self._dem_projected_crs_warning_passed(dem_layer):
             return
 
+        self._compute_memory_estimate = None
         if not self._analysis_mask_warning_passed(dem_layer):
             return
 
         if not self._dem_nodata_warning_passed(dem_layer):
+            return
+
+        if not self._memory_warning_passed():
             return
 
         min_acc = int(self.min_acc_spin.value())
@@ -758,9 +759,9 @@ class DDMHydroLogicDock(QDockWidget):
             self._remove_layer_if_present("subcatchment_layer")
             self.outlet_cells = []
             self.current_assignments = {}
-            self.selected_highlight_cells = set()
+            self.selected_cell_count = 0
             self.selected_catchment_groups = {}
-            self.selection_polygon_geom = None
+            self._catchment_geom_cache = {}
             self._clear_selection_polygon_overlay()
             self._clear_outlet_line_overlay()
 
@@ -773,12 +774,13 @@ class DDMHydroLogicDock(QDockWidget):
             )
             self.engine.build()
 
-            valid_count = len(self.engine.valid_ids)
-            if valid_count > 750000 and min_acc <= 1:
+            valid_count = self.engine.valid_count
+            feature_count = self.engine.flow_feature_count(min_acc)
+            if feature_count > 750000:
                 response = QMessageBox.question(
                     self,
                     "Large flow-path layer",
-                    f"This will create up to {valid_count:,} cell-size flow-path features.\n\n"
+                    f"This will create {feature_count:,} cell-size flow-path features.\n\n"
                     "QGIS can do it, but it may become sluggish. Continue anyway?",
                     enum_member(QMessageBox, "StandardButton", "Yes") | enum_member(QMessageBox, "StandardButton", "No"),
                     enum_member(QMessageBox, "StandardButton", "No"),
@@ -811,12 +813,38 @@ class DDMHydroLogicDock(QDockWidget):
         except HydrologyBuildError as exc:
             QMessageBox.critical(self, "DDM HydroLogic", str(exc))
             self.status_label.setText("DEM processing failed.")
+        except MemoryError:
+            self._cleanup_after_abort(clear_engine=True)
+            QMessageBox.critical(self, "DDM HydroLogic", OUT_OF_MEMORY)
+            self.status_label.setText("DEM processing ran out of memory. Memory released.")
         except Exception as exc:  # pragma: no cover - QGIS runtime safety net
             QMessageBox.critical(self, "DDM HydroLogic", f"Unexpected error while building flow paths:\n\n{exc}")
             self.status_label.setText("DEM processing failed.")
         finally:
             self.active_operation = None
             self._set_busy(False)
+
+    def _memory_warning_passed(self):
+        """Warns before Compute when the DEM area needs more memory than is free."""
+        needed = self._compute_memory_estimate
+        self._compute_memory_estimate = None
+        free = free_memory_bytes()
+        if not needed or not free or needed <= free:
+            return True
+        response = QMessageBox.question(
+            self,
+            "Not enough free memory",
+            f"WARNING: this DEM area needs about {needed / 2 ** 30:,.1f} GB of memory to compute, and "
+            f"{free / 2 ** 30:,.1f} GB is free. QGIS may slow right down or stop with an out-of-memory error. "
+            "Draw a mask polygon around the catchment to process a smaller area, or close other programs. "
+            "Do you still wish to continue?",
+            enum_member(QMessageBox, "StandardButton", "Yes") | enum_member(QMessageBox, "StandardButton", "No"),
+            enum_member(QMessageBox, "StandardButton", "No"),
+        )
+        if response == enum_member(QMessageBox, "StandardButton", "Yes"):
+            return True
+        self.status_label.setText("Compute cancelled. Draw a mask polygon around the catchment to process a smaller area.")
+        return False
 
     def _progress(self, pct, message):
         self.progress.setValue(max(0, min(100, int(pct))))
@@ -979,10 +1007,11 @@ class DDMHydroLogicDock(QDockWidget):
                     "and their displayed upstream flow-path highlights."
                 )
             else:
-                upstream_cells = set(self.engine.collect_upstream(cell_id))
+                upstream_cells = self.engine.collect_upstream(cell_id)
                 self.selected_catchment_groups[int(cell_id)] = upstream_cells
                 before_groups = len(self.selected_catchment_groups)
-                self.selected_catchment_groups = self.engine.normalize_overlapping_cell_groups(self.selected_catchment_groups)
+                kept = self.engine.outermost_outlets(self.selected_catchment_groups)
+                self.selected_catchment_groups = {outlet: self.selected_catchment_groups[outlet] for outlet in kept}
                 after_groups = len(self.selected_catchment_groups)
                 merged_text = ""
                 if after_groups < before_groups:
@@ -996,16 +1025,16 @@ class DDMHydroLogicDock(QDockWidget):
                 f"{action_text} "
                 f"Visible highlighted flow paths: {displayed_highlight_count:,}, limited to the displayed accumulation threshold. "
                 f"Highlighted catchment group(s): {group_count:,}. "
-                f"Persistent contributing cells: {len(self.selected_highlight_cells):,}. "
-                f"Approx highlighted area: {len(self.selected_highlight_cells) * self.engine.cell_area:,.2f} m² "
-                f"({len(self.selected_highlight_cells) * self.engine.cell_area / 10000.0:,.3f} ha). "
+                f"Persistent contributing cells: {self.selected_cell_count:,}. "
+                f"Approx highlighted area: {self.selected_cell_count * self.engine.cell_area:,.2f} m² "
+                f"({self.selected_cell_count * self.engine.cell_area / 10000.0:,.3f} ha). "
                 "Catchment polygons are shown as separate, non-overlapping in-memory light-green overlays, not project layers."
             )
         except HydrologyCancelled:
             self._cleanup_after_abort(clear_engine=False)
             self.status_label.setText("Flow-path selection aborted. Temporary layers and memory released.")
         except Exception as exc:  # pragma: no cover
-            QMessageBox.critical(self, "DDM HydroLogic", f"Could not select upstream flow paths:\n\n{exc}")
+            QMessageBox.critical(self, "DDM HydroLogic", failure_text("Could not select upstream flow paths", exc))
         finally:
             self.active_operation = None
             self._set_busy(False)
@@ -1032,7 +1061,7 @@ class DDMHydroLogicDock(QDockWidget):
 
         containing = []
         for outlet_id, cells in self.selected_catchment_groups.items():
-            if int(cell_id) in cells:
+            if bool(self.engine.drains_through(int(cell_id), int(outlet_id))):
                 containing.append((int(outlet_id), len(cells)))
         if not containing:
             return None
@@ -1048,8 +1077,8 @@ class DDMHydroLogicDock(QDockWidget):
         """Removes one highlighted catchment overlay and it's flow-path highlights."""
         if not self.selected_catchment_groups:
             return 0
-        cells = self.selected_catchment_groups.pop(int(outlet_id), set())
-        return len(cells or [])
+        cells = self.selected_catchment_groups.pop(int(outlet_id), None)
+        return 0 if cells is None else len(cells)
 
     def _refresh_selection_outputs(self):
         """Refreshes yellow path highlights and light-green catchment overlays.
@@ -1057,16 +1086,15 @@ class DDMHydroLogicDock(QDockWidget):
         Callers normalise ``selected_catchment_groups`` before calling this, so
         normalisation is not repeated.
         """
-        self.selected_highlight_cells = set()
-        for cells in self.selected_catchment_groups.values():
-            self.selected_highlight_cells.update(int(c) for c in cells)
+        groups = self.selected_catchment_groups
+        self.selected_cell_count = sum(len(cells) for cells in groups.values())
 
         self._remove_layer_if_present("highlight_layer")
-        if not self.selected_highlight_cells:
+        if not self.selected_cell_count:
             self._clear_selection_polygon_overlay()
             return None
 
-        highlight = self.engine.create_highlight_layer(sorted(self.selected_highlight_cells))
+        highlight = self.engine.create_highlight_layer(self.engine.shown_among(groups.values()))
         QgsProject.instance().addMapLayer(highlight)
         self._update_selection_polygon_overlays(self.selected_catchment_groups)
         return highlight
@@ -1110,9 +1138,9 @@ class DDMHydroLogicDock(QDockWidget):
     def _clear_flow_selection(self):
         """Drops the green flow-path selection, which processing supersedes."""
         self._remove_layer_if_present("highlight_layer")
-        self.selected_highlight_cells = set()
+        self.selected_cell_count = 0
         self.selected_catchment_groups = {}
-        self.selection_polygon_geom = None
+        self._catchment_geom_cache = {}
         self._clear_selection_polygon_overlay()
 
     def open_breakdown(self):
@@ -1292,10 +1320,12 @@ class DDMHydroLogicDock(QDockWidget):
         per_line = []
         if self.engine is None or self.engine.downstream is None or not self._engine_layer_is_available("flow_layer"):
             return per_line
-        displayed = getattr(self.engine, "display_strahler_by_cell", {}) or {}
+        orders = self.engine.display_order
 
         def joined(cell):
-            return sum(1 for u in self.engine.upstream.get(cell, []) if u in displayed) >= 2
+            if orders is None:
+                return False
+            return sum(1 for u in self.engine.upstream.get(cell, []) if orders[u] > 0) >= 2
 
         for line in getattr(self, "breakline_geoms", []):
             geom = self._breakline_in_flow_crs(line)
@@ -1367,17 +1397,15 @@ class DDMHydroLogicDock(QDockWidget):
 
         old_cache = getattr(self, "_catchment_geom_cache", {})
         new_cache = {}
-        combined_geoms = []
 
-        for outlet_id, selected_cells in list(selection_groups.items()):
+        for outlet_id, cells in list(selection_groups.items()):
             self._check_abort_from_dock()
-            if not selected_cells:
+            if not len(cells):
                 continue
-            cells = set(int(c) for c in selected_cells)
 
             # Reuse the dissolved geometry if this catchment's cells are unchanged.
             cached = old_cache.get(int(outlet_id))
-            if cached is not None and cached[0] == cells:
+            if cached is not None and len(cached[0]) == len(cells) and np.array_equal(cached[0], cells):
                 geom_layer = cached[1]
             else:
                 geom_layer = self.engine.dissolve_cells_fast(cells)
@@ -1406,11 +1434,8 @@ class DDMHydroLogicDock(QDockWidget):
             band.setToGeometry(geom, None)
             band.show()
             self.selection_polygon_bands.append(band)
-            combined_geoms.append(geom)
 
         self._catchment_geom_cache = new_cache
-        if combined_geoms:
-            self.selection_polygon_geom = QgsGeometry.unaryUnion(combined_geoms) if len(combined_geoms) > 1 else combined_geoms[0]
 
     def _clear_selection_polygon_overlay(self):
         for band in list(getattr(self, "selection_polygon_bands", [])):
@@ -1424,7 +1449,6 @@ class DDMHydroLogicDock(QDockWidget):
             except Exception:
                 log_ignored("interactive_dock._clear_selection_polygon_overlay")
         self.selection_polygon_bands = []
-        self.selection_polygon_geom = None
 
     # ------------------------------------------------------------------
     # Export and cleanup
@@ -1476,7 +1500,7 @@ class DDMHydroLogicDock(QDockWidget):
         except HydrologyCancelled:
             self.status_label.setText("Export aborted. In-memory layers were left as they were.")
         except Exception as exc:  # pragma: no cover
-            QMessageBox.critical(self, "DDM HydroLogic", f"Export failed:\n\n{exc}")
+            QMessageBox.critical(self, "DDM HydroLogic", failure_text("Export failed", exc))
         finally:
             self.active_operation = None
             self._set_busy(False)
@@ -1580,23 +1604,13 @@ class DDMHydroLogicDock(QDockWidget):
             cells = self._refresh_outlet_cells_from_red_line()
             if not cells:
                 return None
-            raw_valid_ids = getattr(self.engine, "valid_ids", None)
-            valid_ids = set()
-            if raw_valid_ids is not None:
-                try:
-                    valid_ids = set(raw_valid_ids.tolist() if hasattr(raw_valid_ids, "tolist") else raw_valid_ids)
-                except Exception:
-                    try:
-                        valid_ids = set(int(c) for c in raw_valid_ids)
-                    except Exception:
-                        valid_ids = set()
-            # valid_ids can be a NumPy array, so never truth-test it:
-            # `raw_valid_ids or []` raises and would be swallowed below.
+            valid = getattr(self.engine, "valid", None)
+            valid = valid.reshape(-1) if valid is not None else None
             valid_cells = []
             for c in cells:
                 try:
                     cid = int(c)
-                    if not valid_ids or cid in valid_ids:
+                    if valid is None or (0 <= cid < valid.size and valid[cid]):
                         valid_cells.append(cid)
                 except Exception:
                     log_ignored("interactive_dock._current_rorb_outlet_cell")
@@ -1652,7 +1666,9 @@ class DDMHydroLogicDock(QDockWidget):
 
     def _show_dependency_or_runtime_error(self, title, exc):
         """Shows a more useful message when a module/file dependency is missing."""
-        if isinstance(exc, (ModuleNotFoundError, ImportError, FileNotFoundError)):
+        if isinstance(exc, MemoryError):
+            QMessageBox.critical(self, "DDM HydroLogic", OUT_OF_MEMORY)
+        elif isinstance(exc, (ModuleNotFoundError, ImportError, FileNotFoundError)):
             name = getattr(exc, "name", None) or getattr(exc, "filename", None) or str(exc)
             QMessageBox.critical(
                 self,
@@ -2090,17 +2106,18 @@ class DDMHydroLogicDock(QDockWidget):
         """Keeps only blue Strahler flow paths contributing to the processed outlet domain."""
         if self.engine is None or not self._engine_layer_is_available("flow_layer"):
             return
-        domain_cells = set()
+        inside = np.zeros(self.engine.rows * self.engine.cols, dtype=bool)
         for cells in (assignments or {}).values():
-            domain_cells.update(int(c) for c in cells or [])
-        if not domain_cells:
+            if len(cells):
+                inside[np.asarray(cells)] = True
+        if not inside.any():
             return
         layer = self.engine.flow_layer
         delete_ids = []
         for feat in layer.getFeatures():
             try:
                 cell_id = int(feat["cell_id"])
-                if cell_id not in domain_cells:
+                if not (0 <= cell_id < inside.size and inside[cell_id]):
                     delete_ids.append(int(feat.id()))
             except Exception:
                 log_ignored("interactive_dock._restrict_flow_layer_to_assignment_domain")
@@ -2137,13 +2154,13 @@ class DDMHydroLogicDock(QDockWidget):
                 outlet_cell = max(cells, key=lambda c: int(self.engine.accumulation[int(c)]))
             except Exception:
                 outlet_cell = int(cells[0])
+            outlets = [int(o) for o in self.current_assignments]
             try:
-                upstream = set(self.engine.collect_upstream(int(outlet_cell)))
+                inside = self.engine.drains_through(np.asarray(outlets, dtype=np.int64), int(outlet_cell))
             except Exception:
                 log_ignored("interactive_dock._tuflow_catchment_groups")
                 continue
-            upstream.add(int(outlet_cell))
-            members = [int(o) for o in self.current_assignments if int(o) in upstream]
+            members = [o for o, keep in zip(outlets, inside.tolist()) if keep]
             if members:
                 groups.append(members)
         return groups
@@ -2378,9 +2395,9 @@ class DDMHydroLogicDock(QDockWidget):
         """
         self._remove_all_plugin_temporary_layers(include_flow=False, include_highlight=True, include_subcatchments=False)
         self._remove_layer_if_present("highlight_layer")
-        self.selected_highlight_cells = set()
+        self.selected_cell_count = 0
         self.selected_catchment_groups = {}
-        self.selection_polygon_geom = None
+        self._catchment_geom_cache = {}
         self._clear_selection_polygon_overlay()
         gc.collect()
         self.progress.setValue(100)
@@ -2422,9 +2439,9 @@ class DDMHydroLogicDock(QDockWidget):
             log_ignored("interactive_dock._cleanup_after_abort")
         self.current_assignments = {}
         self.outlet_cells = []
-        self.selected_highlight_cells = set()
+        self.selected_cell_count = 0
         self.selected_catchment_groups = {}
-        self.selection_polygon_geom = None
+        self._catchment_geom_cache = {}
         self._clear_selection_polygon_overlay()
         self._clear_outlet_line_overlay()
 
@@ -2497,9 +2514,7 @@ class DDMHydroLogicDock(QDockWidget):
                 log_ignored("interactive_dock._remove_layer_if_present")
         setattr(self.engine, attr_name, None)
         if attr_name == "flow_layer" and self.engine is not None:
-            self.engine.spatial_index = None
-            self.engine.feature_to_cell = {}
-            self.engine.cell_to_feature = {}
+            self.engine.forget_flow_layer()
 
     def _handle_project_layers_will_be_removed(self, layer_ids):
         """Clears stale layer references when the user manually deletes temp layers."""
@@ -2522,13 +2537,12 @@ class DDMHydroLogicDock(QDockWidget):
             if layer_id and layer_id in removed:
                 setattr(self.engine, attr_name, None)
                 if attr_name == "flow_layer":
-                    self.engine.spatial_index = None
-                    self.engine.feature_to_cell = {}
-                    self.engine.cell_to_feature = {}
+                    self.engine.forget_flow_layer()
                     self.outlet_cells = []
                     self.current_assignments = {}
-                    self.selected_highlight_cells = set()
+                    self.selected_cell_count = 0
                     self.selected_catchment_groups = {}
+                    self._catchment_geom_cache = {}
                     self._clear_selection_polygon_overlay()
                     self._clear_outlet_line_overlay()
                     QTimer.singleShot(0, lambda: self._remove_all_plugin_temporary_layers(include_flow=False, include_highlight=True, include_subcatchments=True))
@@ -2574,10 +2588,7 @@ class DDMHydroLogicDock(QDockWidget):
 
         if self.engine is not None:
             if include_flow:
-                self.engine.flow_layer = None
-                self.engine.spatial_index = None
-                self.engine.feature_to_cell = {}
-                self.engine.cell_to_feature = {}
+                self.engine.forget_flow_layer()
             if include_highlight:
                 self.engine.highlight_layer = None
             if include_subcatchments:

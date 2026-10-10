@@ -41,7 +41,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from qgis.core import QgsProject
 
-from .catchment_geometry import subarea_metrics
+from .catchment_geometry import downstream_outlet_map, subarea_metrics
 from .compat import log_ignored
 
 NODE_CIRCLE = 134
@@ -221,44 +221,6 @@ def _feature_centroid_xy(feat) -> Tuple[float, float]:
                 (bbox.yMinimum() + bbox.yMaximum()) / 2.0)
 
 
-def _downstream_map(engine, assignments, selected) -> Dict[int, Optional[int]]:
-    """Maps each subarea outlet to the next downstream selected outlet, or None
-    when it drains out of the model."""
-    cell_to_outlet: Dict[int, int] = {}
-    domain: set = set()
-    for outlet_id, cells in assignments.items():
-        outlet_id = int(outlet_id)
-        if outlet_id not in selected:
-            continue
-        for cell in cells or []:
-            cell_to_outlet[int(cell)] = outlet_id
-            domain.add(int(cell))
-
-    ds_map: Dict[int, Optional[int]] = {}
-    for outlet_id in selected:
-        outlet_id = int(outlet_id)
-        current = outlet_id
-        seen = {outlet_id}
-        downstream = None
-        while True:
-            try:
-                nxt = int(engine.downstream[int(current)])
-            except Exception:
-                nxt = -1
-            if nxt < 0 or nxt in seen:
-                break
-            seen.add(nxt)
-            other = cell_to_outlet.get(nxt)
-            if other is not None and int(other) != outlet_id:
-                downstream = int(other)
-                break
-            if nxt not in domain:
-                break
-            current = nxt
-        ds_map[outlet_id] = downstream
-    return ds_map
-
-
 def _topological_order(ds_map, engine) -> List[int]:
     """Orders subareas upstream-to-downstream so nodes precede their links."""
     depth_cache: Dict[int, int] = {}
@@ -341,13 +303,13 @@ def write_xprafts_from_engine(
         )
 
     features = _subcatchment_features_by_outlet(engine)
-    selected = {int(o) for o, cells in assignments.items() if cells and int(o) in features}
+    selected = {int(o) for o, cells in assignments.items() if len(cells) and int(o) in features}
     if not selected:
         raise XpRaftsExportError(
             "No processed subcatchments with matching outlet_id values are available to export."
         )
 
-    ds_map = _downstream_map(engine, assignments, selected)
+    ds_map = downstream_outlet_map(engine, assignments, selected)
     _terminal_outlet(ds_map)  # validate a single outlet before writing
     ordered = _topological_order(ds_map, engine)
     name_of = {int(o): f"S{i:03d}" for i, o in enumerate(ordered, start=1)}
@@ -427,7 +389,7 @@ def write_xprafts_from_engine(
 def model_id_map(engine, assignments):
     """Node names as written to the .xpx, keyed by outlet cell."""
     features = _subcatchment_features_by_outlet(engine)
-    selected = {int(o) for o, cells in assignments.items() if cells and int(o) in features}
-    ds_map = _downstream_map(engine, assignments, selected)
+    selected = {int(o) for o, cells in assignments.items() if len(cells) and int(o) in features}
+    ds_map = downstream_outlet_map(engine, assignments, selected)
     ordered = _topological_order(ds_map, engine)
     return {int(o): f"S{i:03d}" for i, o in enumerate(ordered, start=1)}, ds_map

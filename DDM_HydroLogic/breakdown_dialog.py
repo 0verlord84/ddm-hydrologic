@@ -55,7 +55,7 @@ from qgis.core import QgsCoordinateTransform, QgsFeature, QgsGeometry, QgsProjec
 from qgis.gui import QgsRubberBand
 
 from .catchment_geometry import channel_slopes, downstream_outlet_map, upstream_area_ha
-from .compat import enum_member, log_ignored, qt_enum
+from .compat import enum_member, failure_text, log_ignored, qt_enum
 from .hydrology_engine import HydrologyCancelled
 
 LAYER_NAME = "DDM HydroLogic subcatchments - dissolved outlines temporary"
@@ -115,7 +115,7 @@ class BreakdownDialog(QDialog):
         # Whatever was there when the window opened, so Close can put it back.
         live = self._live_layer()
         self.opened_with_layer = live is not None
-        self.opening_assignments = {int(k): list(v) for k, v in (dock.current_assignments or {}).items()}
+        self.opening_assignments = {int(k): v for k, v in (dock.current_assignments or {}).items()}
         self.opening_rows = self._snapshot(live)
 
         self.dirty = False
@@ -480,7 +480,7 @@ class BreakdownDialog(QDialog):
             self.engine.subcatchment_layer = live
         self.dock._recalculate_subcatchment_area_fields(live)
         self.engine.apply_breakdown_ids(live, assignments, self.dock.outlet_cells)
-        self.dock.current_assignments = {int(k): list(v) for k, v in assignments.items()}
+        self.dock.current_assignments = {int(k): v for k, v in assignments.items()}
 
     def _revert(self):
         """Puts back whatever existed when the window opened."""
@@ -497,7 +497,7 @@ class BreakdownDialog(QDialog):
         else:
             if live is not None:
                 self._replace_features(live, self.opening_rows)
-            self.dock.current_assignments = {int(k): list(v) for k, v in self.opening_assignments.items()}
+            self.dock.current_assignments = dict(self.opening_assignments)
         self.dirty = False
 
     # ------------------------------------------------------------------
@@ -759,7 +759,7 @@ class BreakdownDialog(QDialog):
         except HydrologyCancelled:
             self.dock.status_label.setText("Subcatchment processing aborted. The subcatchments on the map are unchanged.")
         except Exception as exc:  # pragma: no cover
-            QMessageBox.critical(self, "DDM HydroLogic", f"Could not process the subcatchments:\n\n{exc}")
+            QMessageBox.critical(self, "DDM HydroLogic", failure_text("Could not process the subcatchments", exc))
         finally:
             # Every dock operation ends by setting the bar; without this it froze
             # wherever the engine last reported, usually in the high seventies.

@@ -330,7 +330,8 @@ def write_model_gis_outputs(
 
         # Streams: this sub-area's flow paths merged into Strahler reaches. Reaches
         # stop at the sub-area boundary so every line keeps a valid sub-area id.
-        for path, strahler, length_m in dissolved_reaches(engine, assignments.get(outlet) or []):
+        cells = assignments.get(outlet)
+        for path, strahler, length_m in dissolved_reaches(engine, cells if cells is not None else []):
             points = [QgsPointXY(engine.cell_center(int(c))) for c in path]
             stream_rows.append((
                 QgsGeometry.fromPolylineXY(points),

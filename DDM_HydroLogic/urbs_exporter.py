@@ -29,7 +29,7 @@ import math
 import os
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from .catchment_geometry import SLOPE_FLOOR, subarea_metrics
+from .catchment_geometry import SLOPE_FLOOR, downstream_outlet_map, subarea_metrics
 from .compat import log_ignored
 
 # Written verbatim as the routing-file header; these are model defaults the
@@ -108,45 +108,6 @@ def _feature_fraction(feat, field_name: str, present_names: set) -> float:
 
 
 # --- topology -------------------------------------------------------------
-
-def _downstream_map(engine, assignments, selected) -> Dict[int, Optional[int]]:
-    """Map each subarea outlet to the next downstream selected outlet, or None
-    when it drains out of the model."""
-    cell_to_outlet: Dict[int, int] = {}
-    domain: set = set()
-    for outlet_id, cells in assignments.items():
-        outlet_id = int(outlet_id)
-        if outlet_id not in selected:
-            continue
-        for cell in cells or []:
-            cell_to_outlet[int(cell)] = outlet_id
-            domain.add(int(cell))
-
-    ds_map: Dict[int, Optional[int]] = {}
-    downstream = getattr(engine, "downstream", None)
-    for outlet_id in selected:
-        outlet_id = int(outlet_id)
-        current = outlet_id
-        seen = {outlet_id}
-        result = None
-        while True:
-            try:
-                nxt = int(downstream[int(current)])
-            except Exception:
-                nxt = -1
-            if nxt < 0 or nxt in seen:
-                break
-            seen.add(nxt)
-            other = cell_to_outlet.get(nxt)
-            if other is not None and int(other) != outlet_id:
-                result = int(other)
-                break
-            if nxt not in domain:
-                break
-            current = nxt
-        ds_map[outlet_id] = result
-    return ds_map
-
 
 def _all_upstream(subarea: str, upstream: Dict[str, List[str]]) -> List[str]:
     """Every subarea upstream of ``subarea``. Iterative depth-first with a
@@ -305,13 +266,13 @@ def write_urbs_from_engine(
         )
 
     features = _subcatchment_features_by_outlet(engine)
-    selected = {int(o) for o, cells in assignments.items() if cells and int(o) in features}
+    selected = {int(o) for o, cells in assignments.items() if len(cells) and int(o) in features}
     if not selected:
         raise UrbsExportError(
             "No processed subcatchments with matching outlet_id values are available to export."
         )
 
-    ds_map = _downstream_map(engine, assignments, selected)
+    ds_map = downstream_outlet_map(engine, assignments, selected)
     ordered = sorted(selected)
     id_of = {outlet: index for index, outlet in enumerate(ordered, start=1)}
     metrics = subarea_metrics(engine, features, assignments, ordered)
@@ -377,6 +338,6 @@ def write_urbs_from_engine(
 def model_id_map(engine, assignments) -> Tuple[Dict[int, str], Dict[int, Optional[int]]]:
     """Sub-area labels as written to the .vec and .csv, keyed by outlet cell."""
     features = _subcatchment_features_by_outlet(engine)
-    selected = {int(o) for o, cells in assignments.items() if cells and int(o) in features}
-    ds_map = _downstream_map(engine, assignments, selected)
+    selected = {int(o) for o, cells in assignments.items() if len(cells) and int(o) in features}
+    ds_map = downstream_outlet_map(engine, assignments, selected)
     return {int(o): str(i) for i, o in enumerate(sorted(selected), start=1)}, ds_map

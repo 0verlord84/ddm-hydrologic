@@ -21,6 +21,7 @@ import os
 from enum import Enum
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import numpy as np
 from qgis.core import QgsPointXY
 
 from .catchment_geometry import downstream_outlet_map, downstream_path, subarea_metrics
@@ -158,7 +159,31 @@ def _midpoint(points: Sequence[Tuple[float, float]]) -> Tuple[float, float]:
     return (float(points[-1][0]), float(points[-1][1]))
 
 
-def _walk_downstream_path(engine, start_cell: int, selected_outlets: set[int], domain_cells: set[int], model_outlet_cell: Optional[int] = None):
+class _CellSet:
+    """A set of grid cells kept as a mask over the grid, for ``cell in cells`` tests."""
+
+    def __init__(self, engine):
+        size = int(getattr(engine, "rows", 0) or 0) * int(getattr(engine, "cols", 0) or 0)
+        self.mask = np.zeros(size, dtype=bool) if size > 0 else None
+        self.extra = set()
+
+    def add_all(self, cells):
+        cells = np.asarray(cells, dtype=np.int64)
+        if self.mask is None:
+            self.extra.update(cells.tolist())
+            return
+        inside = (cells >= 0) & (cells < self.mask.size)
+        self.mask[cells[inside]] = True
+        self.extra.update(cells[~inside].tolist())
+
+    def __contains__(self, cell):
+        cell = int(cell)
+        if self.mask is not None and 0 <= cell < self.mask.size:
+            return bool(self.mask[cell])
+        return cell in self.extra
+
+
+def _walk_downstream_path(engine, start_cell: int, selected_outlets: set[int], domain_cells: _CellSet, model_outlet_cell: Optional[int] = None):
     """Walks from a subcatchment outlet to the next selected outlet or model outlet.
 
     Returns ``(path_points, downstream_selected_outlet, terminal_point)``.
@@ -429,37 +454,42 @@ def write_rorb_catg_from_engine(
         raise RorbCatgExportError("No current subcatchment assignments are available. Process subcatchments in 7. Subcatchments breakdown first.")
 
     sub_features = _subcatchment_features_by_outlet(engine)
-    selected_outlets = {int(k) for k, cells in assignments.items() if cells and int(k) in sub_features}
+    selected_outlets = {int(k) for k, cells in assignments.items() if len(cells) and int(k) in sub_features}
     if not selected_outlets:
         raise RorbCatgExportError("No processed subcatchments with matching outlet_id values are available for RORB export.")
 
     model_outlet_cell = int(model_outlet_cell) if model_outlet_cell is not None else None
-    upstream_to_model_outlet = None
-    if model_outlet_cell is not None:
-        try:
-            upstream_to_model_outlet = set(engine.collect_upstream(int(model_outlet_cell)))
-            upstream_to_model_outlet.add(int(model_outlet_cell))
-        except Exception:
-            upstream_to_model_outlet = None
 
-    if upstream_to_model_outlet is not None:
-        selected_outlets = {int(o) for o in selected_outlets if int(o) in upstream_to_model_outlet}
+    def reaches_model_outlet(cells):
+        """True where a cell drains through the model outlet cell."""
+        return engine.drains_through(np.asarray(cells, dtype=np.int64), model_outlet_cell)
+
+    clip_to_outlet = model_outlet_cell is not None
+    if clip_to_outlet:
+        try:
+            reaches_model_outlet([model_outlet_cell])
+        except Exception:
+            clip_to_outlet = False
+
+    if clip_to_outlet:
+        candidates = sorted(selected_outlets)
+        selected_outlets = {o for o, keep in zip(candidates, reaches_model_outlet(candidates).tolist()) if keep}
         if not selected_outlets:
             raise RorbCatgExportError(
                 "No processed subcatchments drain to the drawn outlet line. "
                 "Clear/re-draw the outlet line, process subcatchments again, then export to RORB."
             )
 
-    domain_cells = set()
+    domain_cells = _CellSet(engine)
     for outlet_id, cells in assignments.items():
-        if int(outlet_id) not in selected_outlets:
+        if int(outlet_id) not in selected_outlets or not len(cells):
             continue
-        for cell in cells or []:
-            cell = int(cell)
-            if upstream_to_model_outlet is None or cell in upstream_to_model_outlet:
-                domain_cells.add(cell)
+        cells = np.asarray(cells)
+        if clip_to_outlet:
+            cells = cells[reaches_model_outlet(cells)]
+        domain_cells.add_all(cells)
     if model_outlet_cell is not None:
-        domain_cells.add(int(model_outlet_cell))
+        domain_cells.add_all([model_outlet_cell])
 
     ordered_outlets = sorted(selected_outlets, key=lambda cid: (int(engine.accumulation[int(cid)]), int(cid)))
     outlet_node_id = len(ordered_outlets) + 1

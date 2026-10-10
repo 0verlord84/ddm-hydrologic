@@ -21,8 +21,11 @@ where the sub-area's rainfall-excess enters the channel network.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from typing import Dict, List, Optional, Set, Tuple
+
+import numpy as np
 
 from .compat import log_ignored
 
@@ -101,7 +104,7 @@ def centroid_of(feat) -> Tuple[float, float, bool]:
     return (float(point.x()), float(point.y()), bool(inside))
 
 
-def main_stem(engine, outlet_cell: int, member: Set[int]) -> List[int]:
+def main_stem(engine, outlet_cell: int, member) -> List[int]:
     """The subarea's main stream, ordered outlet -> head.
 
     Traced from the subarea outlet upstream, always taking the branch carrying
@@ -201,15 +204,24 @@ def equal_area_slope(engine, path: List[int]) -> float:
     return max(2.0 * area / (length * length), SLOPE_FLOOR)
 
 
-def catchment_profile(engine, outlet_cell: int, member: Set[int]) -> List[int]:
+def highest_cell(engine, cells) -> int:
+    """The subarea's highest cell on the pit-filled surface, the lowest cell id on a tie."""
+    surface = getattr(engine, "filled_dem", None)
+    if isinstance(surface, np.ndarray) and isinstance(cells, np.ndarray):
+        heights = surface.reshape(-1)[cells]
+        return int(cells[heights == heights.max()].min())
+    return int(min(cells, key=lambda c: (-elevation_of(engine, c), int(c))))
+
+
+def catchment_profile(engine, outlet_cell: int, cells) -> List[int]:
     """Profile for the catchment slope: subarea high point down to its outlet.
 
     Returned outlet -> high point so it shares the equal-area routine with the
     channel profile.
     """
-    if not member:
+    if cells is None or not len(cells):
         return [int(outlet_cell)]
-    high_cell = max(member, key=lambda c: elevation_of(engine, c))
+    high_cell = highest_cell(engine, cells)
     path = downstream_path(engine, int(high_cell), int(outlet_cell))
     if not path:
         return [int(outlet_cell)]
@@ -229,23 +241,40 @@ def dissolved_reaches(engine, cells) -> List[Tuple[List[int], int, float]]:
     order upwards so the layer draws small streams first.
     """
     displayed = getattr(engine, "cell_to_feature", {}) or {}
-    order_by = getattr(engine, "display_strahler_by_cell", {}) or {}
-    upstream = getattr(engine, "upstream", {})
+    shown = getattr(engine, "shown_cells", None)
+    order_by = getattr(engine, "display_order", None)
+    if order_by is None:
+        order_by = {}
     downstream = getattr(engine, "downstream", None)
 
-    pool = {int(c) for c in cells if int(c) in displayed}
+    if isinstance(shown, np.ndarray) and isinstance(cells, np.ndarray):
+        pool = set(cells[shown[cells]].tolist())
+    else:
+        pool = {int(c) for c in cells if int(c) in displayed}
     if not pool:
         return []
 
     def order_of(cell_id: int) -> int:
         try:
+            if isinstance(order_by, np.ndarray):
+                return int(order_by[int(cell_id)]) or 1
             return int(order_by.get(int(cell_id), 1) or 1)
         except Exception:
             return 1
 
+    # Upstream cells inside the pool, lowest id first.
+    feeds: Dict[int, List[int]] = {}
+    for cell_id in sorted(pool):
+        try:
+            down = int(downstream[cell_id])
+        except Exception:
+            log_ignored("catchment_geometry.dissolved_reaches")
+            continue
+        if down in pool:
+            feeds.setdefault(down, []).append(cell_id)
+
     def same_order_parents(cell_id: int) -> List[int]:
-        return [int(u) for u in upstream.get(int(cell_id), [])
-                if int(u) in pool and order_of(u) == order_of(cell_id)]
+        return [u for u in feeds.get(int(cell_id), []) if order_of(u) == order_of(cell_id)]
 
     def can_merge(cell_id: int, next_cell: int) -> bool:
         if int(next_cell) not in pool:
@@ -313,22 +342,74 @@ def dissolved_reaches(engine, cells) -> List[Tuple[List[int], int, float]]:
     return reaches
 
 
+class _Owners:
+    """Which of the selected subareas each cell belongs to.
+
+    An array over the grid when the engine has one, so no per-cell dictionary is
+    built for a large catchment; a dictionary otherwise.
+    """
+
+    def __init__(self, engine, assignments, selected):
+        selected = {int(o) for o in selected}
+        size = int(getattr(engine, "rows", 0) or 0) * int(getattr(engine, "cols", 0) or 0)
+        self.array = None
+        self.table = None
+        if size > 0:
+            owner = np.full(size, -1, dtype=np.int32 if size < 2 ** 31 else np.int64)
+            for outlet_id, cells in assignments.items():
+                if int(outlet_id) in selected and cells is not None and len(cells):
+                    owner[np.asarray(cells)] = int(outlet_id)
+            self.array = owner
+        else:
+            table: Dict[int, int] = {}
+            for outlet_id, cells in assignments.items():
+                if int(outlet_id) in selected:
+                    for cell in (cells if cells is not None else []):
+                        table[int(cell)] = int(outlet_id)
+            self.table = table
+
+    def of(self, cell: int) -> Optional[int]:
+        """Outlet of the selected subarea holding ``cell``, or None."""
+        if self.array is None:
+            return self.table.get(int(cell))
+        if 0 <= cell < self.array.size:
+            value = int(self.array[cell])
+            if value >= 0:
+                return value
+        return None
+
+    def holds(self, outlet: int) -> "_Members":
+        return _Members(self, int(outlet))
+
+
+class _Members:
+    """``cell in members`` for one subarea."""
+
+    __slots__ = ("owners", "outlet")
+
+    def __init__(self, owners: _Owners, outlet: int):
+        self.owners = owners
+        self.outlet = outlet
+
+    def __contains__(self, cell) -> bool:
+        return self.owners.of(int(cell)) == self.outlet
+
+
+def _fingerprint(cells):
+    """Short digest of a subarea's cells, to key cached measurements."""
+    if isinstance(cells, np.ndarray):
+        cells = np.ascontiguousarray(cells)
+        return (str(cells.dtype), int(cells.size), hashlib.blake2b(memoryview(cells), digest_size=16).digest())
+    return frozenset(int(c) for c in cells)
+
+
 def downstream_outlet_map(engine, assignments, selected) -> Dict[int, Optional[int]]:
     """Map each selected subarea outlet to the next selected outlet downstream.
 
     A value of None means the subarea drains out of the model, so it sits at a
     model outlet.
     """
-    cell_to_outlet: Dict[int, int] = {}
-    domain: Set[int] = set()
-    for outlet_id, cells in assignments.items():
-        outlet_id = int(outlet_id)
-        if outlet_id not in selected:
-            continue
-        for cell in cells or []:
-            cell_to_outlet[int(cell)] = outlet_id
-            domain.add(int(cell))
-
+    owners = _Owners(engine, assignments, selected)
     ds_map: Dict[int, Optional[int]] = {}
     downstream = getattr(engine, "downstream", None)
     for outlet_id in selected:
@@ -344,11 +425,11 @@ def downstream_outlet_map(engine, assignments, selected) -> Dict[int, Optional[i
             if nxt < 0 or nxt in seen:
                 break
             seen.add(nxt)
-            other = cell_to_outlet.get(nxt)
-            if other is not None and int(other) != outlet_id:
-                result = int(other)
+            other = owners.of(nxt)
+            if other is None:
                 break
-            if nxt not in domain:
+            if other != outlet_id:
+                result = other
                 break
             current = nxt
         ds_map[outlet_id] = result
@@ -367,17 +448,22 @@ def subarea_metrics(engine, features: Dict[int, object], assignments: Dict[int, 
     centroid. The engine clears them whenever it builds a new subcatchment layer.
     """
     cache = getattr(engine, "metrics_cache", None)
+    owners = None
     metrics: Dict[int, dict] = {}
     for outlet in outlets:
         outlet = int(outlet)
-        member = {int(c) for c in (assignments.get(outlet) or [])}
+        cells = assignments.get(outlet)
+        if cells is None:
+            cells = []
         feat = features[outlet]
         cx, cy, inside = centroid_of(feat)
-        key = (outlet, cx, cy, frozenset(member)) if isinstance(cache, dict) else None
+        key = (outlet, cx, cy, _fingerprint(cells)) if isinstance(cache, dict) else None
         if key is not None and key in cache:
             metrics[outlet] = dict(cache[key])
             continue
-        stem = main_stem(engine, outlet, member)
+        if owners is None:
+            owners = _Owners(engine, assignments, outlets)
+        stem = main_stem(engine, outlet, owners.holds(outlet))
         entry = entry_cell(engine, stem, (cx, cy))
         stem_length_m = path_length_m(engine, stem)
         metrics[outlet] = {
@@ -388,7 +474,7 @@ def subarea_metrics(engine, features: Dict[int, object], assignments: Dict[int, 
             "entry_cell": entry,
             "length_km": stem_length_m / 1000.0,
             "channel_slope": equal_area_slope(engine, stem),
-            "catchment_slope": equal_area_slope(engine, catchment_profile(engine, outlet, member)),
+            "catchment_slope": equal_area_slope(engine, catchment_profile(engine, outlet, cells)),
         }
         if key is not None:
             cache[key] = dict(metrics[outlet])
@@ -408,7 +494,7 @@ def breakdown_order(engine, assignments, outlet_cells=None) -> List[int]:
     own numbering, because RORB in particular fixes sub-area identity by the
     order its control vector visits them.
     """
-    selected = {int(o) for o, cells in (assignments or {}).items() if cells}
+    selected = {int(o) for o, cells in (assignments or {}).items() if len(cells)}
     if not selected:
         return []
     ds_map = downstream_outlet_map(engine, assignments, selected)
@@ -489,9 +575,9 @@ def channel_slopes(engine, assignments, outlets) -> Dict[int, float]:
     Lighter than :func:`subarea_metrics`, which also walks the centroid, entry
     point and whole-catchment profile. The breakdown table only needs the stream.
     """
+    owners = _Owners(engine, assignments, outlets)
     slopes: Dict[int, float] = {}
     for outlet in outlets:
         outlet = int(outlet)
-        member = {int(c) for c in (assignments.get(outlet) or [])}
-        slopes[outlet] = equal_area_slope(engine, main_stem(engine, outlet, member))
+        slopes[outlet] = equal_area_slope(engine, main_stem(engine, outlet, owners.holds(outlet)))
     return slopes

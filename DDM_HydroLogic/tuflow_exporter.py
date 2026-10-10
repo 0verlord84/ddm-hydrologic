@@ -323,7 +323,7 @@ def write_tuflow_from_engine(
         )
 
     features = _subcatchment_features_by_outlet(engine)
-    selected = {int(o) for o, cells in assignments.items() if cells and int(o) in features}
+    selected = {int(o) for o, cells in assignments.items() if len(cells) and int(o) in features}
     if not selected:
         raise TuflowExportError(
             "No processed subcatchments with matching outlet_id values are available to export."

@@ -14,9 +14,12 @@ it can be tested easily inside QGIS. It builds a D8 graph directly from a DEM,
 then exposes helpers for upstream tracing, outlet-line selection and vector export.
 """
 
+from array import array
 from collections import defaultdict
 import heapq
+from itertools import repeat
 import math
+import weakref
 
 import numpy as np
 from osgeo import gdal, ogr, osr
@@ -43,12 +46,22 @@ from qgis.core import (
 
 from .catchment_geometry import breakdown_order
 from .compat import enum_member, log_ignored
-from .graph_index import FlowIndex
+from .graph_index import BLOCK, FlowGraphError, FlowIndex, nonzero32
 
-NO_INDEX_MESSAGE = (
-    "This mode needs the flow graph index, which could not be built for this DEM. "
-    "Press 4. Compute to create the flow paths again."
-)
+# Band types a 32-bit float holds exactly; anything else is read as 64-bit.
+_FLOAT32_TYPES = {gdal.GDT_Byte, gdal.GDT_UInt16, gdal.GDT_Int16, gdal.GDT_Float32}
+if hasattr(gdal, "GDT_Int8"):
+    _FLOAT32_TYPES.add(gdal.GDT_Int8)
+
+# Cells the priority flood takes off its queue between progress updates.
+_FLOOD_STEP = 65536
+
+# Peak memory of Compute and the processing after it, measured on a 1 m DEM: a
+# fixed part, bytes per cell of the processing window on top of the elevation
+# itself, and bytes per valid cell.
+_BASE_BYTES = 256 * 2 ** 20
+_BYTES_PER_CELL = 32
+_BYTES_PER_VALID_CELL = 8
 
 
 class HydrologyBuildError(Exception):
@@ -57,6 +70,70 @@ class HydrologyBuildError(Exception):
 
 class HydrologyCancelled(Exception):
     """Raised when the user aborts a running hydrology operation."""
+
+
+def _vector_memory_driver():
+    """In-memory vector driver: MEM from GDAL 3.11 on, Memory before that."""
+    return ogr.GetDriverByName("MEM") or ogr.GetDriverByName("Memory")
+
+
+def _cell_array(cells):
+    """Cell ids as a numpy array, from an array, a list or a set."""
+    if isinstance(cells, np.ndarray):
+        return cells
+    return np.fromiter((int(c) for c in cells), dtype=np.int64)
+
+
+def _elevation_keys(values):
+    """Turns a float array into unsigned integers that sort the same way, in place.
+
+    -0.0 is made 0.0 first, so the two stay equal as they are when compared as floats.
+    """
+    np.add(values, 0, out=values)
+    if values.dtype == np.float32:
+        bits, top = values.view(np.uint32), np.uint32(1 << 31)
+    else:
+        bits, top = values.view(np.uint64), np.uint64(1 << 63)
+    for start in range(0, bits.size, BLOCK):
+        block = bits[start:start + BLOCK]
+        negative = (block & top) != 0
+        np.invert(block, out=block, where=negative)
+        np.bitwise_or(block, top, out=block, where=~negative)
+    return bits
+
+
+def _float_values(bits):
+    """Undoes _elevation_keys in place and returns the floats."""
+    if bits.dtype == np.uint32:
+        top, kind = np.uint32(1 << 31), np.float32
+    else:
+        top, kind = np.uint64(1 << 63), np.float64
+    for start in range(0, bits.size, BLOCK):
+        block = bits[start:start + BLOCK]
+        positive = (block & top) != 0
+        np.bitwise_and(block, ~top, out=block, where=positive)
+        np.invert(block, out=block, where=~positive)
+    return bits.view(kind)
+
+
+class _UpstreamCells:
+    """``get(cell)`` gives the valid cells draining straight into a cell, lowest id first.
+
+    Read from the flow index when asked, so no per-cell lists are kept.
+    """
+
+    __slots__ = ("index",)
+
+    def __init__(self, index):
+        self.index = index
+
+    def get(self, cell, default=None):
+        if self.index is None:
+            return [] if default is None else default
+        return self.index.upstream_cells(int(cell))
+
+    def __getitem__(self, cell):
+        return self.get(cell)
 
 
 class D8HydrologyEngine:
@@ -72,30 +149,34 @@ class D8HydrologyEngine:
         self.mask_cell_count = 0
         self.mask_raster_cell_count = 0
         self.mask_nodata_cell_count = 0
-        self.mask_nodata_cell_ids = []
+        self.nodata_cells = None
 
         self.dataset_path = None
         self.geotransform = None
         self.projection = None
+        # The grid is the processing window with a frame of invalid cells one cell
+        # wide all round. Grid row 0 is raster row ``row_offset``, and a cell id
+        # is ``row * cols + col`` on the grid.
         self.rows = 0
         self.cols = 0
+        self.row_offset = 0
+        self.col_offset = 0
         self.cell_width = 0.0
         self.cell_height = 0.0
         self.cell_area = 0.0
         self.nodata = None
+        self.elevation_bytes = 4
         self.dem = None
         self.valid = None
+        self.valid_count = 0
 
         self.downstream = None
         self.accumulation = None
         self.strahler = None
-        self.display_strahler_by_cell = {}
-        self.upstream = defaultdict(list)
-        self.valid_ids = None
+        self.display_order = None
         self.filled_dem = None
         self.index = None
         self.metrics_cache = {}
-        self.connectivity_outlet_count = 0
 
         self.flow_layer = None
         self.highlight_layer = None
@@ -103,6 +184,12 @@ class D8HydrologyEngine:
         self.spatial_index = None
         self.feature_to_cell = {}
         self.cell_to_feature = {}
+        self.shown_cells = None
+
+    @property
+    def upstream(self):
+        """Upstream neighbours of a cell on request: ``engine.upstream.get(cell, [])``."""
+        return _UpstreamCells(self.index)
 
     # ------------------------------------------------------------------
     # DEM reading and graph construction
@@ -129,7 +216,22 @@ class D8HydrologyEngine:
             # Cancelation checks must never become the reason a hydrology build fails.
             log_ignored("hydrology_engine._check_cancelled")
 
-    def _read_dem(self):
+    def _index_progress(self, fraction):
+        """Progress while the flow index is built. Its later passes report None,
+        which only checks for an abort: they also run outside any operation."""
+        if fraction is None:
+            self._check_cancelled()
+        else:
+            self._emit(56 + 26 * fraction, "Computing accumulation and Strahler order from connected outlets")
+
+    def _read_dem(self, values=True, keep_nodata=False):
+        """Reads the DEM over the processing window into the framed grid.
+
+        With a mask polygon only the raster rows and columns around it are read,
+        otherwise the whole raster. ``values`` False keeps the valid-cell mask
+        only, which is all the preflight checks use, and ``keep_nodata`` keeps the
+        mask of the NoData cells they report.
+        """
         self._emit(2, "Reading DEM")
         uri = self.dem_layer.dataProvider().dataSourceUri()
         self.dataset_path = uri.split("|", 1)[0]
@@ -148,37 +250,138 @@ class D8HydrologyEngine:
             )
 
         band = ds.GetRasterBand(1)
-        arr = band.ReadAsArray()
-        if arr is None:
+        if band is None:
             raise HydrologyBuildError("Could not read band 1 from the DEM.")
 
         self.geotransform = gt
         self.projection = ds.GetProjection()
-        self.rows, self.cols = arr.shape
         self.cell_width = abs(float(gt[1]))
         self.cell_height = abs(float(gt[5]))
         self.cell_area = self.cell_width * self.cell_height
         self.nodata = band.GetNoDataValue()
 
-        dem = arr.astype("float64", copy=False)
-        valid = np.isfinite(dem)
-        if self.nodata is not None and np.isfinite(self.nodata):
-            valid &= dem != float(self.nodata)
-
-        self.dem = dem
-        self.valid = valid
-
+        mask_geom = None
         if self.mask_layer is not None:
-            self._emit(8, "Applying analysis mask polygon to DEM")
-            valid = self._apply_analysis_mask_to_valid(valid)
+            self._emit(4, "Applying analysis mask polygon to DEM")
+            mask_geom = self._combined_mask_geometry_in_dem_crs()
+            if mask_geom is None:
+                self.mask_layer = None
+        burned = self._set_window(ds.RasterYSize, ds.RasterXSize, mask_geom)
+
+        kind = np.float32 if band.DataType in _FLOAT32_TYPES else np.float64
+        self.elevation_bytes = np.dtype(kind).itemsize
+        nodata = self._nodata_as(kind)
+        rows, cols = self.rows - 2, self.cols - 2
+        row0, col0 = self.row_offset + 1, self.col_offset + 1
+        valid = np.zeros((self.rows, self.cols), dtype=bool)
+        dem = np.zeros((self.rows, self.cols), dtype=kind) if values else None
+        step = max(1, BLOCK // max(1, cols))
+        for start in range(0, rows, step):
+            self._emit(4 + 8 * start / rows, "Reading DEM")
+            height = min(step, rows - start)
+            arr = band.ReadAsArray(col0, row0 + start, cols, height)
+            if arr is None:
+                raise HydrologyBuildError("Could not read band 1 from the DEM.")
+            block = arr.astype(kind, copy=False)
+            ok = np.isfinite(block)
+            if nodata is not None:
+                ok &= block != nodata
+            valid[1 + start:1 + start + height, 1:-1] = ok
+            if dem is not None:
+                dem[1 + start:1 + start + height, 1:-1] = block
+        ds = None
+
+        if burned is not None:
+            self.mask_raster_cell_count = int(np.count_nonzero(burned))
+            missing = burned & ~valid
+            self.mask_nodata_cell_count = int(np.count_nonzero(missing))
+            valid &= burned
+            self.mask_cell_count = int(np.count_nonzero(valid))
+        elif keep_nodata:
+            missing = ~valid
+            missing[0, :] = missing[-1, :] = False
+            missing[:, 0] = missing[:, -1] = False
+        if keep_nodata:
+            self.nodata_cells = missing
+        if burned is not None and self.mask_cell_count <= 0:
+            raise HydrologyBuildError("The mask polygon does not overlaps with any valid DEM cells.")
 
         if not np.any(valid):
             raise HydrologyBuildError("The DEM contains no valid cells!")
 
         self.valid = valid
-        self.valid_ids = np.flatnonzero(valid.reshape(-1))
+        self.valid_count = int(np.count_nonzero(valid))
+        self.dem = dem
         suffix = f"; analysis mask cells: {self.mask_cell_count:,}" if self.mask_layer is not None else ""
-        self._emit(12, f"DEM read: {self.cols} x {self.rows} cells{suffix}")
+        self._emit(12, f"DEM read: {cols} x {rows} cells{suffix}")
+
+    def _nodata_as(self, kind):
+        """The NoData value in the precision the DEM is held in, or None when no cell can equal it."""
+        if self.nodata is None:
+            return None
+        try:
+            value = float(self.nodata)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        if kind == np.float32 and abs(value) > float(np.finfo(np.float32).max):
+            return None
+        return kind(value)
+
+    def _set_window(self, raster_rows, raster_cols, mask_geom):
+        """Sets the grid to the raster cells the mask polygon touches, or to the whole raster.
+
+        Returns the rasterised mask over the grid, or None without a mask.
+        """
+        full = (0, raster_rows, 0, raster_cols)
+        window = full
+        if mask_geom is not None:
+            window = self._mask_window(raster_rows, raster_cols, mask_geom)
+            if window is None:
+                raise HydrologyBuildError("The mask polygon does not overlaps with any valid DEM cells.")
+        while True:
+            row0, row1, col0, col1 = window
+            self.rows, self.cols = row1 - row0 + 2, col1 - col0 + 2
+            self.row_offset, self.col_offset = row0 - 1, col0 - 1
+            if self.rows * self.cols >= 2 ** 31:
+                raise HydrologyBuildError(
+                    f"The DEM area to process has {self.rows * self.cols:,} cells, more than the 2,147,483,647 "
+                    "this plugin can index. Draw a mask polygon around the catchment to process a smaller area."
+                )
+            if mask_geom is None:
+                return None
+            burned = self._rasterize_mask_geometry(mask_geom)
+            # The window is meant to hold every cell the polygon touches. Should one
+            # sit on its edge where the raster carries on, read the whole raster.
+            spills = ((row0 > 0 and burned[1].any()) or (row1 < raster_rows and burned[-2].any())
+                      or (col0 > 0 and burned[:, 1].any()) or (col1 < raster_cols and burned[:, -2].any()))
+            if not spills or window == full:
+                return burned
+            window = full
+
+    def _mask_window(self, raster_rows, raster_cols, mask_geom, margin=2):
+        """Raster rows and columns ``(row0, row1, col0, col1)`` round the mask polygon,
+        or None when it misses the raster."""
+        gt = self.geotransform
+        box = mask_geom.boundingBox()
+        cols = sorted(((box.xMinimum() - gt[0]) / gt[1], (box.xMaximum() - gt[0]) / gt[1]))
+        rows = sorted(((box.yMinimum() - gt[3]) / gt[5], (box.yMaximum() - gt[3]) / gt[5]))
+        if not all(math.isfinite(v) for v in cols + rows):
+            return 0, raster_rows, 0, raster_cols
+        col0 = max(0, int(math.floor(cols[0])) - margin)
+        col1 = min(raster_cols, int(math.ceil(cols[1])) + margin)
+        row0 = max(0, int(math.floor(rows[0])) - margin)
+        row1 = min(raster_rows, int(math.ceil(rows[1])) + margin)
+        if col1 <= col0 or row1 <= row0:
+            return None
+        return row0, row1, col0, col1
+
+    def _grid_transform(self, row, col):
+        """Geotransform of a block of the grid whose top-left cell is grid (row, col)."""
+        gt = self.geotransform
+        r, c = row + self.row_offset, col + self.col_offset
+        return (gt[0] + c * gt[1] + r * gt[2], gt[1], gt[2], gt[3] + c * gt[4] + r * gt[5], gt[4], gt[5])
 
     def _combined_mask_geometry_in_dem_crs(self):
         """Returns the optional analysis mask poly inheriting the DEM CRS."""
@@ -225,17 +428,16 @@ class D8HydrologyEngine:
         return mask_geom
 
     def _rasterize_mask_geometry(self, mask_geom):
-        """Rasterises the mask poly onto the DEM using GDAL MEM."""
+        """Rasterises the mask poly onto the grid using GDAL MEM; the frame stays clear."""
         try:
             mask_ds = gdal.GetDriverByName("MEM").Create("", int(self.cols), int(self.rows), 1, gdal.GDT_Byte)
-            mask_ds.SetGeoTransform(self.geotransform)
+            mask_ds.SetGeoTransform(self._grid_transform(0, 0))
             if self.projection:
                 mask_ds.SetProjection(self.projection)
             mask_band = mask_ds.GetRasterBand(1)
             mask_band.Fill(0)
 
-            ogr_driver = ogr.GetDriverByName("Memory")
-            vector_ds = ogr_driver.CreateDataSource("ddm_mask")
+            vector_ds = _vector_memory_driver().CreateDataSource("ddm_mask")
             srs = None
             if self.projection:
                 srs = osr.SpatialReference()
@@ -257,37 +459,16 @@ class D8HydrologyEngine:
             err = gdal.RasterizeLayer(mask_ds, [1], vector_layer, burn_values=[1], options=["ALL_TOUCHED=TRUE"])
             if err != 0:
                 raise HydrologyBuildError(f"GDAL RasterizeLayer failed with code {err}.")
-            arr = mask_band.ReadAsArray()
-            return arr.astype(bool)
+            burned = mask_band.ReadAsArray().view(np.bool_)
+            burned[0, :] = burned[-1, :] = False
+            burned[:, 0] = burned[:, -1] = False
+            return burned
         except HydrologyBuildError:
+            raise
+        except MemoryError:
             raise
         except Exception as exc:
             raise HydrologyBuildError(f"Could not rasterise the mask polygon: {exc}") from exc
-
-    def _apply_analysis_mask_to_valid(self, valid):
-        """Restricts valid DEM cells to the (not so) optional user-digitised mask polygon."""
-        mask_geom = self._combined_mask_geometry_in_dem_crs()
-        if mask_geom is None:
-            self.mask_layer = None
-            self.mask_cell_count = 0
-            self.mask_raster_cell_count = 0
-            self.mask_nodata_cell_count = 0
-            self.mask_nodata_cell_ids = []
-            return valid
-
-        mask_valid = self._rasterize_mask_geometry(mask_geom)
-        filtered = valid & mask_valid
-        nodata_mask = mask_valid & (~valid)
-        self.mask_raster_cell_count = int(np.count_nonzero(mask_valid))
-        self.mask_cell_count = int(np.count_nonzero(filtered))
-        self.mask_nodata_cell_count = int(np.count_nonzero(nodata_mask))
-        if self.mask_nodata_cell_count:
-            self.mask_nodata_cell_ids = [int(i) for i in np.flatnonzero(nodata_mask.reshape(-1))]
-        else:
-            self.mask_nodata_cell_ids = []
-        if self.mask_cell_count <= 0:
-            raise HydrologyBuildError("The mask polygon does not overlaps with any valid DEM cells.")
-        return filtered
 
     def inspect_analysis_mask_quality(self):
         """Returns a preflight summary of how the optional mask intersects the DEM.
@@ -296,25 +477,49 @@ class D8HydrologyEngine:
         whether to continue when the digitised mask touches NoData/outside cells.
         """
         if self.mask_layer is None:
-            return {
-                "has_mask": False,
-                "mask_cells": 0,
-                "valid_cells": 0,
-                "nodata_cells": 0,
-                "nodata_cell_ids": [],
-            }
-        self._read_dem()
+            return {"has_mask": False, "mask_cells": 0, "valid_cells": 0, "nodata_cells": 0}
+        self._read_dem(values=False, keep_nodata=True)
         return {
             "has_mask": True,
             "mask_cells": int(self.mask_raster_cell_count),
             "valid_cells": int(self.mask_cell_count),
             "nodata_cells": int(self.mask_nodata_cell_count),
-            "nodata_cell_ids": list(self.mask_nodata_cell_ids),
         }
 
+    def nodata_geometry(self):
+        """One dissolved polygon over the NoData cells kept by the last read."""
+        cells = self.nodata_cells
+        if cells is None or not cells.any():
+            return QgsGeometry()
+        rows = np.flatnonzero(cells.any(axis=1))
+        cols = np.flatnonzero(cells.any(axis=0))
+        r0, r1, c0, c1 = int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
+        parts = [geom for _value, geom in self._polygonize(cells[r0:r1, c0:c1].astype(np.uint8), r0, c0)]
+        if not parts:
+            return QgsGeometry()
+        return parts[0] if len(parts) == 1 else QgsGeometry.unaryUnion(parts)
+
+    def memory_estimate(self):
+        """Approximate peak bytes Compute and processing need, for the window and valid cells of the last read."""
+        cells = self.rows * self.cols
+        return (_BASE_BYTES + cells * (_BYTES_PER_CELL + self.elevation_bytes)
+                + self.valid_count * _BYTES_PER_VALID_CELL)
+
     def _build_downstream_graph(self):
-        """Builds the D8 receiver graph using boundary-aware connectivity."""
-        self._build_downstream_graph_fill_connectivity()
+        """Builds a hydrologically connected D8 receiver graph.
+
+        Uses a boundary-aware priority-flood pass. Valid cells adjacent to NoData
+        are considered as outlets as well as valid cells on the outer raster edge.
+        A clipped DEM with a NoData border therefore drains to its edges rather
+        than to one global-low cell.
+        """
+        self._emit(18, "Building hydrologically connected D8 flow graph")
+        outlet_count = self._priority_flood_connectivity_graph(
+            progress_start=18,
+            progress_span=34,
+            message="Connecting D8 flow paths from low boundary cells upstream",
+        )
+        self._emit(52, f"D8 connectivity complete. Boundary outlet cells: {outlet_count:,}")
 
     def _valid_boundary_mask(self):
         """Returns valid DEM cells that can behave as outlets.
@@ -328,140 +533,115 @@ class D8HydrologyEngine:
         """
         valid = self.valid
         rows, cols = self.rows, self.cols
-        boundary = np.zeros((rows, cols), dtype=bool)
-        if rows <= 0 or cols <= 0:
-            return boundary
-
-        boundary[0, :] |= valid[0, :]
-        boundary[rows - 1, :] |= valid[rows - 1, :]
-        boundary[:, 0] |= valid[:, 0]
-        boundary[:, cols - 1] |= valid[:, cols - 1]
-
-        invalid = ~valid
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                src_r = slice(max(0, -dr), min(rows, rows - dr))
-                src_c = slice(max(0, -dc), min(cols, cols - dc))
-                nbr_r = slice(max(0, dr), min(rows, rows + dr))
-                nbr_c = slice(max(0, dc), min(cols, cols + dc))
-                view = boundary[src_r, src_c]
-                view |= valid[src_r, src_c] & invalid[nbr_r, nbr_c]
-                boundary[src_r, src_c] = view
+        inner = valid[1:-1, 1:-1]
+        # The invalid frame round the grid puts a cell on the raster edge beside an
+        # invalid cell, so one test covers both cases.
+        surrounded = inner.copy()
+        for dr in (0, 1, 2):
+            for dc in (0, 1, 2):
+                if dr != 1 or dc != 1:
+                    surrounded &= valid[dr:dr + rows - 2, dc:dc + cols - 2]
+        boundary = np.zeros_like(valid)
+        boundary[1:-1, 1:-1] = inner & ~surrounded
         return boundary
 
     def _priority_flood_connectivity_graph(self, progress_start=18, progress_span=34, message="Connecting D8 flow paths from low cells upstream"):
         """Builds a boundary-aware priority-flood receiver graph.
 
-        Called by _build_downstream_graph_fill_connectivity. It starts from every valid
+        Called by _build_downstream_graph. It starts from every valid
         raster/mask boundary cell, not merely from the outside row/column of the
         raster. That distinction matters for clipped DEM's with a NoData frame all around its bounds.
+
+        Cells come off the queue lowest first, equal levels in the order they were
+        queued, and each claims its unclaimed valid neighbours as upstream cells,
+        raising any that sit lower to its own level. A level is held as an
+        order-preserving integer so a heap entry is one integer, and a neighbour at
+        or below the current level goes to a plain first-in first-out queue, which
+        hands cells out in exactly the order the heap would. The DEM array becomes
+        the pit-filled surface in place. Returns the number of outlet cells.
         """
-        rows, cols = self.rows, self.cols
-        downstream = np.full(rows * cols, -1, dtype=np.int64)
-        filled = np.full((rows, cols), np.nan, dtype="float64")
-        visited = np.zeros((rows, cols), dtype=bool)
-        visit_order = np.full(rows * cols, -1, dtype=np.int64)
+        valid = self.valid.reshape(-1)
+        cols = self.cols
+        keys = _elevation_keys(self.dem.reshape(-1))
+        downstream = np.full(valid.size, -1, dtype=np.int32)
+        # 1 where a cell is not valid or has already been claimed.
+        blocked = np.logical_not(valid).view(np.uint8)
+        claimed, level_of, receiver = memoryview(blocked), memoryview(keys), memoryview(downstream)
+        offsets = (-cols - 1, -cols, -cols + 1, -1, 1, cols - 1, cols, cols + 1)
+        heappop, heappush = heapq.heappop, heapq.heappush
+        low_bits, step = 0xFFFFFFFF, 1 << 32
 
-        directions = (
-            (-1, -1), (-1, 0), (-1, 1),
-            (0, -1), (0, 1),
-            (1, -1), (1, 0), (1, 1),
-        )
-
+        # A heap entry is level << 64 | queue order << 32 | cell, so entries sort
+        # by level and then by the order they were queued.
         heap = []
-        counter = 0
-        outlet_count = 0
-        popped = 0
+        tag = 0
+        for cell in nonzero32(self._valid_boundary_mask().reshape(-1)).tolist():
+            claimed[cell] = 1
+            heap.append((level_of[cell] << 64) | tag | cell)
+            tag += step
+        heapq.heapify(heap)
+        outlet_count = len(heap)
 
-        def add_seed(row, col):
-            nonlocal counter, outlet_count
-            if not self.valid[row, col] or visited[row, col]:
-                return
-            visited[row, col] = True
-            elev = float(self.dem[row, col])
-            filled[row, col] = elev
-            heapq.heappush(heap, (elev, counter, int(row), int(col)))
-            counter += 1
-            outlet_count += 1
-
-        boundary = self._valid_boundary_mask()
-        seed_ids = np.flatnonzero(boundary.reshape(-1))
-        for seed_number, seed_id in enumerate(seed_ids.tolist()):
-            if not seed_number & 4095:
-                self._check_cancelled()
-            add_seed(seed_id // cols, seed_id % cols)
-
-        if not heap:
-            # Defensive fallback. A valid DEM with no boundary should not exist
-            # after the boundary mask above, but GIS formats vary.
-            seed_id = min(self.valid_ids, key=lambda cid: float(self.dem[int(cid) // cols, int(cid) % cols]))
-            add_seed(int(seed_id) // cols, int(seed_id) % cols)
-
-        total_valid = max(1, len(self.valid_ids))
-        processed = 0
-
+        queue = array("i")
+        pending = 0
+        level = -1
+        ceiling = 0
+        done = 0
+        total = max(1, self.valid_count)
         while True:
-            while heap:
-                if not processed & 4095:
-                    self._check_cancelled()
-                elev, _seq, row, col = heapq.heappop(heap)
-                cell_id = row * cols + col
-                if visit_order[cell_id] < 0:
-                    visit_order[cell_id] = popped
-                    popped += 1
-                processed += 1
-
-                for dr, dc in directions:
-                    nr = row + dr
-                    nc = col + dc
-                    if nr < 0 or nr >= rows or nc < 0 or nc >= cols:
+            exhausted = False
+            for _ in repeat(None, _FLOOD_STEP):
+                if heap and heap[0] < ceiling:
+                    cell = heappop(heap) & low_bits
+                elif pending < len(queue):
+                    cell = queue[pending]
+                    pending += 1
+                elif heap:
+                    entry = heappop(heap)
+                    level = entry >> 64
+                    ceiling = (level + 1) << 64
+                    cell = entry & low_bits
+                    if pending:
+                        queue = array("i")
+                        pending = 0
+                else:
+                    exhausted = True
+                    break
+                for offset in offsets:
+                    other = cell + offset
+                    if claimed[other]:
                         continue
-                    if visited[nr, nc] or not self.valid[nr, nc]:
-                        continue
-
-                    nbr_id = nr * cols + nc
-                    visited[nr, nc] = True
-                    downstream[nbr_id] = cell_id
-
-                    nbr_elev = float(self.dem[nr, nc])
-                    spill_elev = max(nbr_elev, float(elev))
-                    filled[nr, nc] = spill_elev
-                    heapq.heappush(heap, (spill_elev, counter, int(nr), int(nc)))
-                    counter += 1
-
-                if processed % 50000 == 0:
-                    self._emit(progress_start + progress_span * processed / total_valid, message)
-
-            self._check_cancelled()
-            remaining = self.valid & ~visited
-            if not np.any(remaining):
+                    claimed[other] = 1
+                    receiver[other] = cell
+                    key = level_of[other]
+                    if key <= level:
+                        level_of[other] = level
+                        queue.append(other)
+                    else:
+                        heappush(heap, (key << 64) | tag | other)
+                        tag += step
+            if not exhausted:
+                done += _FLOOD_STEP
+                self._emit(progress_start + progress_span * min(1.0, done / total), message)
+                continue
+            left = np.flatnonzero(blocked == 0)
+            if not left.size:
                 break
-            remaining_ids = np.flatnonzero(remaining.reshape(-1))
-            seed_id = min(remaining_ids, key=lambda cid: float(self.dem[int(cid) // cols, int(cid) % cols]))
-            add_seed(int(seed_id) // cols, int(seed_id) % cols)
+            # Valid cells no boundary cell reaches, which the invalid frame round the
+            # grid rules out: the lowest of them becomes an outlet, lowest id on ties.
+            cell = int(left[np.argmin(keys[left])])
+            claimed[cell] = 1
+            heappush(heap, (level_of[cell] << 64) | tag | cell)
+            tag += step
+            outlet_count += 1
+            level, ceiling = -1, 0
 
-        return downstream, filled, outlet_count, visit_order
-
-    def _build_downstream_graph_fill_connectivity(self):
-        """Builds a hydrologically connected D8 receiver graph.
-
-        Uses a boundary-aware priority-flood pass. Valid cells adjacent to NoData
-        are considered as outlets as well as valid cells on the outer raster edge.
-        A clipped DEM with a NoData border therefore drains to its edges rather
-        than to one global-low cell.
-        """
-        self._emit(18, "Building hydrologically connected D8 flow graph")
-        downstream, filled, outlet_count, _visit_order = self._priority_flood_connectivity_graph(
-            progress_start=18,
-            progress_span=34,
-            message="Connecting D8 flow paths from low boundary cells upstream",
-        )
+        filled = _float_values(keys)
+        np.copyto(filled, np.nan, where=~valid)
+        self.filled_dem = self.dem
+        self.dem = None
         self.downstream = downstream
-        self.filled_dem = filled
-        self.connectivity_outlet_count = outlet_count
-        self._emit(52, f"D8 connectivity complete. Boundary outlet cells: {outlet_count:,}")
+        return outlet_count
 
     def _build_upstream_accumulation_and_strahler(self):
         """Computes accumulation and Strahler order over the connected D8 graph.
@@ -470,102 +650,41 @@ class D8HydrologyEngine:
         included, counted from the outlets the connectivity pass produced. The
         Strahler order here is per cell: a source cell is 1, and two or more
         upstream cells sharing the top order raise it by one. Both come from the
-        array index when the graph is a clean forest, which it is after the
-        priority flood; otherwise the depth-first walk computes them.
+        array index built over the graph.
         """
         self._emit(56, "Computing accumulation and Strahler order from connected outlets")
+        owner = weakref.ref(self)
 
-        index = FlowIndex(self.downstream, self.valid.reshape(-1), check=self._check_cancelled)
-        self.upstream = defaultdict(list)
-        for src, dst in zip(self.valid_ids.tolist(), index.parent[self.valid_ids].tolist()):
-            if dst >= 0:
-                self.upstream[dst].append(src)
+        def progress(fraction):
+            engine = owner()
+            if engine is not None:
+                engine._index_progress(fraction)
 
-        if index.is_forest:
-            self.index = index
-            self.accumulation = index.accumulation()
-            self.strahler = index.strahler()
-        else:
-            self.index = None
-            self._accumulate_by_walk()
+        try:
+            index = FlowIndex(self.downstream, self.valid, self.cols, progress=progress)
+        except FlowGraphError as exc:
+            raise HydrologyBuildError(f"The D8 flow graph could not be indexed ({exc}). Press 4. Compute again.") from exc
+        if not index.is_forest:
+            raise HydrologyBuildError("The D8 flow graph contains a loop and cannot be used. Press 4. Compute again.")
+        self.index = index
+        self.accumulation = index.accumulation()
+        self.strahler = index.strahler()
         self._emit(82, "Accumulation and Strahler order complete")
-
-    def _accumulate_by_walk(self):
-        """Depth-first accumulation and Strahler order, for a graph that is not a forest."""
-        n = self.rows * self.cols
-        # Stable outlet order: lowest filled/elevation outlets first. This does
-        # not change the calcs, but it keeps processing and layer creation
-        # deterministic.
-        outlet_ids = [int(i) for i in self.valid_ids if int(self.downstream[int(i)]) < 0]
-        outlet_ids.sort(key=lambda cid: (float(self.filled_dem[cid // self.cols, cid % self.cols]), cid))
-
-        accumulation = np.zeros(n, dtype=np.int64)
-        # Broad DEM-cell Strahler-style ordering is kept as a fallback/internal
-        # diagnostic. Display and export Strahler order is recalculated later on
-        # the extracted stream network only (official Strahler stream
-        # order applies to stream/channel links, not every DEM cell).
-        strahler = np.full(n, -1, dtype=np.int16)
-        processed = 0
-        total_valid = max(1, len(self.valid_ids))
-
-        seen_roots = set()
-        for outlet in outlet_ids:
-            self._check_cancelled()
-            if outlet in seen_roots:
-                continue
-            stack = [(outlet, False)]
-            while stack:
-                self._check_cancelled()
-                cell_id, expanded = stack.pop()
-                if not expanded:
-                    if accumulation[cell_id] > 0:
-                        continue
-                    stack.append((cell_id, True))
-                    for upstream_id in self.upstream.get(cell_id, []):
-                        if accumulation[upstream_id] == 0:
-                            stack.append((upstream_id, False))
-                else:
-                    children = self.upstream.get(cell_id, [])
-                    if not children:
-                        accumulation[cell_id] = 1
-                        strahler[cell_id] = 1
-                    else:
-                        accumulation[cell_id] = 1 + sum(int(accumulation[ch]) for ch in children)
-                        child_orders = [int(strahler[ch]) for ch in children if int(strahler[ch]) >= 1]
-                        if not child_orders:
-                            strahler[cell_id] = 1
-                        else:
-                            max_order = max(child_orders)
-                            strahler[cell_id] = max_order + (1 if child_orders.count(max_order) >= 2 else 0)
-                    seen_roots.add(cell_id)
-                    processed += 1
-                    if processed % 50000 == 0:
-                        self._emit(56 + 24 * processed / total_valid, "Accumulation and Strahler order")
-
-        # Safety fallback for any valid cell not reached because of an unexpected
-        # malformed output. This should not happen after the connectivity pass.
-        missing = [int(i) for i in self.valid_ids if accumulation[int(i)] == 0]
-        for cell_id in missing:
-            accumulation[cell_id] = 1
-            strahler[cell_id] = 1
-
-        self.accumulation = accumulation
-        self.strahler = strahler
 
     # ------------------------------------------------------------------
     # Geometry helpers
     # ------------------------------------------------------------------
     def cell_center(self, cell_id):
-        row = int(cell_id) // self.cols
-        col = int(cell_id) % self.cols
+        row = int(cell_id) // self.cols + self.row_offset
+        col = int(cell_id) % self.cols + self.col_offset
         gt = self.geotransform
         x = gt[0] + (col + 0.5) * gt[1]
         y = gt[3] + (row + 0.5) * gt[5]
         return QgsPointXY(float(x), float(y))
 
     def cell_polygon(self, cell_id):
-        row = int(cell_id) // self.cols
-        col = int(cell_id) % self.cols
+        row = int(cell_id) // self.cols + self.row_offset
+        col = int(cell_id) % self.cols + self.col_offset
         gt = self.geotransform
         x0 = gt[0] + col * gt[1]
         x1 = gt[0] + (col + 1) * gt[1]
@@ -599,8 +718,8 @@ class D8HydrologyEngine:
 
         gt = self.geotransform
         try:
-            col = int(math.floor((float(point.x()) - float(gt[0])) / float(gt[1])))
-            row = int(math.floor((float(point.y()) - float(gt[3])) / float(gt[5])))
+            col = int(math.floor((float(point.x()) - float(gt[0])) / float(gt[1]))) - self.col_offset
+            row = int(math.floor((float(point.y()) - float(gt[3])) / float(gt[5]))) - self.row_offset
         except Exception:
             return None
 
@@ -636,36 +755,45 @@ class D8HydrologyEngine:
           downstream channel order increases by one;
         - if a lower-order link joins a higher-order link, the downstream order
           stays at the higher order.
+
+        Returns the order of every grid cell, 0 off the network, and keeps it as
+        ``display_order``.
         """
-        displayed = {int(c) for c in displayed_cells}
-        if not displayed:
-            self.display_strahler_by_cell = {}
-            return {}
+        shown = np.zeros(self.rows * self.cols, dtype=bool)
+        cells = _cell_array(displayed_cells)
+        if cells.size:
+            shown[cells] = True
+        self.display_order = self.index.stream_order(shown)
+        return self.display_order
 
-        stream_upstream = {
-            c: [int(u) for u in self.upstream.get(int(c), []) if int(u) in displayed]
-            for c in displayed
-        }
+    def flow_cells(self, min_accumulation=1):
+        """Cells drawn as flow-path segments at a threshold, ascending.
 
-        # Accumulation increases monotonically downstream in the D8 tree, so this
-        # is an upstream-to-downstream traversal of the extracted stream network.
-        ordered_cells = sorted(displayed, key=lambda c: (int(self.accumulation[int(c)]), int(c)))
-        stream_order = {}
-        for cell_id in ordered_cells:
-            child_orders = [int(stream_order[u]) for u in stream_upstream.get(int(cell_id), []) if int(u) in stream_order]
-            if not child_orders:
-                stream_order[int(cell_id)] = 1
-                continue
-            max_order = max(child_orders)
-            stream_order[int(cell_id)] = int(max_order + 1 if child_orders.count(max_order) >= 2 else max_order)
+        A segment runs from a cell to its receiver, so a cell without one is not drawn.
+        """
+        valid = self.valid.reshape(-1)
+        threshold = int(min_accumulation)
+        parts = []
+        for start in range(0, valid.size, BLOCK):
+            stop = min(valid.size, start + BLOCK)
+            keep = valid[start:stop] & (self.downstream[start:stop] >= 0) & (self.accumulation[start:stop] >= threshold)
+            found = np.flatnonzero(keep)
+            if found.size:
+                parts.append((found + start).astype(np.int32))
+        if not parts:
+            return np.empty(0, dtype=np.int32)
+        return parts[0] if len(parts) == 1 else np.concatenate(parts)
 
-        # Defensive fallback in case a malformed graph left a stream cell without
-        # processed upstream records. It should not occur.
-        for cell_id in displayed:
-            stream_order.setdefault(int(cell_id), 1)
-
-        self.display_strahler_by_cell = stream_order
-        return stream_order
+    def flow_feature_count(self, min_accumulation=1):
+        """Number of flow-path segments a threshold would draw."""
+        valid = self.valid.reshape(-1)
+        threshold = int(min_accumulation)
+        count = 0
+        for start in range(0, valid.size, BLOCK):
+            stop = min(valid.size, start + BLOCK)
+            keep = valid[start:stop] & (self.downstream[start:stop] >= 0) & (self.accumulation[start:stop] >= threshold)
+            count += int(np.count_nonzero(keep))
+        return count
 
     def create_flow_layer(self, min_accumulation=1):
         """Creates a temporary line layer containing cell-to-cell flow segments."""
@@ -695,40 +823,33 @@ class D8HydrologyEngine:
         provider.addAttributes(fields)
         layer.updateFields()
 
-        candidate_ids = []
-        for cell_id in self.valid_ids:
-            down_id = int(self.downstream[cell_id])
-            if down_id < 0:
-                continue
-            if int(self.accumulation[cell_id]) < int(min_accumulation):
-                continue
-            candidate_ids.append(int(cell_id))
-
-        stream_strahler = self._compute_stream_strahler_orders(candidate_ids)
-        candidate_ids.sort(key=lambda c: (int(stream_strahler.get(int(c), 1)), int(self.accumulation[c]), c))
+        candidates = self.flow_cells(min_accumulation)
+        stream_strahler = self._compute_stream_strahler_orders(candidates)
+        accumulation = self.accumulation[candidates]
+        orders = stream_strahler[candidates]
+        sort = np.lexsort((candidates, accumulation, orders))
+        candidates, accumulation, orders = candidates[sort], accumulation[sort], orders[sort]
+        receivers = self.downstream[candidates]
         fields = layer.fields()
         features = []
         chunk_size = 25000
-        total = max(1, len(candidate_ids))
+        total = max(1, candidates.size)
+        cols, row_offset, col_offset = self.cols, self.row_offset, self.col_offset
 
-        for idx, cell_id in enumerate(candidate_ids):
+        rows = zip(candidates.tolist(), receivers.tolist(), accumulation.tolist(), orders.tolist())
+        for idx, (cell_id, down_id, acc_cells, order) in enumerate(rows):
             if not idx & 4095:
                 self._check_cancelled()
-            down_id = int(self.downstream[cell_id])
-            p0 = self.cell_center(cell_id)
-            p1 = self.cell_center(down_id) if down_id >= 0 else p0
-            geom = QgsGeometry.fromPolylineXY([p0, p1])
-            row = cell_id // self.cols
-            col = cell_id % self.cols
+            geom = QgsGeometry.fromPolylineXY([self.cell_center(cell_id), self.cell_center(down_id)])
             feat = QgsFeature(fields)
             feat.setGeometry(geom)
             feat.setAttributes([
-                int(cell_id),
-                int(row),
-                int(col),
-                int(down_id),
-                int(self.accumulation[cell_id]),
-                int(stream_strahler.get(int(cell_id), 1)),
+                cell_id,
+                cell_id // cols + row_offset,
+                cell_id % cols + col_offset,
+                down_id,
+                acc_cells,
+                order,
                 round(float(geom.length()), 2),
             ])
             features.append(feat)
@@ -762,7 +883,8 @@ class D8HydrologyEngine:
                     continue
         except Exception:
             # Fallback for partially initialised layers.
-            orders = set(int(v) for v in getattr(self, "display_strahler_by_cell", {}).values() if int(v) >= 1)
+            shown = self.display_order
+            orders = set() if shown is None else {int(v) for v in np.unique(shown) if int(v) >= 1}
 
         orders = sorted(orders)
         if not orders:
@@ -800,17 +922,19 @@ class D8HydrologyEngine:
         if self.flow_layer is None:
             raise HydrologyBuildError("No temporary flow-path layer is available for export.")
 
+        cell_count = self.rows * self.cols
         displayed_cells = set()
-        stream_order = {}
         for feat in self.flow_layer.getFeatures():
             self._check_cancelled()
             try:
                 cell_id = int(feat["cell_id"])
-                displayed_cells.add(cell_id)
-                stream_order[cell_id] = max(1, int(feat["strahler"]))
+                # A feature whose order does not read as a number is left out.
+                int(feat["strahler"])
             except Exception:
                 log_ignored("hydrology_engine.create_reach_flow_layer")
                 continue
+            if 0 <= cell_id < cell_count:
+                displayed_cells.add(cell_id)
         if not displayed_cells:
             raise HydrologyBuildError("The temporary flow-path layer contains no displayed flow paths to export.")
 
@@ -821,10 +945,7 @@ class D8HydrologyEngine:
         # Keeps only valid Strahler streams. Proper Strahler order is 1-based; any
         # zero/negative/blank order is either stale data or a malformed temporary
         # feature and must not leak into the final GeoPackage.
-        displayed_cells = {
-            int(c) for c in displayed_cells
-            if int(stream_order.get(int(c), 0)) >= 1
-        }
+        displayed_cells = {c for c in displayed_cells if int(stream_order[c]) >= 1}
         if not displayed_cells:
             raise HydrologyBuildError("The temporary flow-path layer contains no Strahler order 1 or higher paths to export.")
 
@@ -855,17 +976,17 @@ class D8HydrologyEngine:
 
         displayed_upstream = defaultdict(list)
         for cell_id in displayed_cells:
-            down = int(self.downstream[int(cell_id)])
+            down = int(self.downstream[cell_id])
             if down in displayed_cells:
-                displayed_upstream[int(down)].append(int(cell_id))
+                displayed_upstream[down].append(cell_id)
+
+        def order_of(cell_id):
+            return int(stream_order[cell_id])
 
         def same_order_upstream(cell_id):
             """Upstream displayed cells that have the same Strahler order."""
-            order = int(stream_order.get(int(cell_id), 0))
-            return [
-                int(u) for u in displayed_upstream.get(int(cell_id), [])
-                if int(stream_order.get(int(u), 0)) == order
-            ]
+            order = order_of(cell_id)
+            return [u for u in displayed_upstream.get(cell_id, []) if order_of(u) == order]
 
         def can_merge_downstream(cell_id, next_cell):
             """Returns True if adjacent segments belong to the same Strahler reach.
@@ -877,47 +998,48 @@ class D8HydrologyEngine:
             the order changes, or more than one same-order candidate could feed
             the downstream segment.
             """
-            cell_id = int(cell_id)
-            next_cell = int(next_cell)
             if next_cell not in displayed_cells:
                 return False
-            order = int(stream_order.get(cell_id, 0))
-            next_order = int(stream_order.get(next_cell, 0))
+            order = order_of(cell_id)
+            next_order = order_of(next_cell)
             if order < 1 or next_order < 1 or order != next_order:
                 return False
             same_order_parents = same_order_upstream(next_cell)
-            return len(same_order_parents) == 1 and int(same_order_parents[0]) == cell_id
+            return len(same_order_parents) == 1 and same_order_parents[0] == cell_id
 
         def has_merge_parent(cell_id):
-            same_order_parents = same_order_upstream(int(cell_id))
+            same_order_parents = same_order_upstream(cell_id)
             if len(same_order_parents) != 1:
                 return False
-            return can_merge_downstream(int(same_order_parents[0]), int(cell_id))
+            return can_merge_downstream(same_order_parents[0], cell_id)
 
-        starts = [int(c) for c in displayed_cells if not has_merge_parent(int(c))]
-        starts.sort(key=lambda c: (int(stream_order.get(int(c), 1)), int(self.accumulation[int(c)]), int(c)))
+        def sort_key(cell_id):
+            return (order_of(cell_id), int(self.accumulation[cell_id]), cell_id)
+
+        starts = [c for c in displayed_cells if not has_merge_parent(c)]
+        starts.sort(key=sort_key)
 
         visited = set()
         features = []
 
         def build_reach(start_cell):
             cells = []
-            cur = int(start_cell)
+            cur = start_cell
             while cur in displayed_cells and cur not in visited:
                 self._check_cancelled()
                 cells.append(cur)
                 visited.add(cur)
-                nxt = int(self.downstream[int(cur)])
+                nxt = int(self.downstream[cur])
                 if not can_merge_downstream(cur, nxt) or nxt in visited:
                     break
-                cur = int(nxt)
+                cur = nxt
             return cells
 
         def add_reach(cells, reach_id):
             if not cells:
                 return False
             points = [self.cell_center(c) for c in cells]
-            last_down = int(self.downstream[int(cells[-1])])
+            last_down = int(self.downstream[cells[-1]])
             if last_down >= 0:
                 points.append(self.cell_center(last_down))
             if len(points) < 2:
@@ -930,9 +1052,9 @@ class D8HydrologyEngine:
                 int(cells[0]),
                 int(cells[-1]),
                 int(len(cells)),
-                int(self.accumulation[int(cells[0])]),
-                int(self.accumulation[int(cells[-1])]),
-                int(stream_order.get(int(cells[-1]), 1)),
+                int(self.accumulation[cells[0]]),
+                int(self.accumulation[cells[-1]]),
+                order_of(cells[-1]),
                 round(float(geom.length()), 2),
             ])
             features.append(feat)
@@ -940,15 +1062,15 @@ class D8HydrologyEngine:
 
         reach_id = 1
         for start in starts:
-            if int(start) in visited:
+            if start in visited:
                 continue
             if add_reach(build_reach(start), reach_id):
                 reach_id += 1
 
         # Defensive fallback: malformed graph or edited temporary layer. Export any
         # unvisited segment as its own reach rather than silently dropping it.
-        for cell_id in sorted(displayed_cells, key=lambda c: (int(stream_order.get(int(c), 1)), int(self.accumulation[int(c)]), int(c))):
-            if int(cell_id) in visited:
+        for cell_id in sorted(displayed_cells, key=sort_key):
+            if cell_id in visited:
                 continue
             if add_reach(build_reach(cell_id), reach_id):
                 reach_id += 1
@@ -962,6 +1084,7 @@ class D8HydrologyEngine:
         self.spatial_index = QgsSpatialIndex()
         self.feature_to_cell = {}
         self.cell_to_feature = {}
+        self.shown_cells = None
         if self.flow_layer is None:
             return
         for feat in self.flow_layer.getFeatures():
@@ -969,6 +1092,18 @@ class D8HydrologyEngine:
             cell_id = int(feat["cell_id"])
             self.feature_to_cell[int(feat.id())] = cell_id
             self.cell_to_feature[cell_id] = int(feat.id())
+        shown = np.zeros(self.rows * self.cols, dtype=bool)
+        cells = np.fromiter(self.cell_to_feature.keys(), dtype=np.int64, count=len(self.cell_to_feature))
+        shown[cells[(cells >= 0) & (cells < shown.size)]] = True
+        self.shown_cells = shown
+
+    def forget_flow_layer(self):
+        """Drops the lookups that belong to the flow-path layer once it has gone."""
+        self.flow_layer = None
+        self.spatial_index = None
+        self.feature_to_cell = {}
+        self.cell_to_feature = {}
+        self.shown_cells = None
 
     def nearest_flow_cell(self, map_point, canvas_crs, max_distance_map_units=None):
         """Return the nearest flow-cell id to a clicked canvas point."""
@@ -1015,25 +1150,59 @@ class D8HydrologyEngine:
     # Upstream tracing and catchment construction
     # ------------------------------------------------------------------
     def collect_upstream(self, outlet_cell_id, limit=None):
-        """Returns all upstream cells contributing to a nominated outlet cell."""
-        outlet_cell_id = int(outlet_cell_id)
-        index = self._index_ready((outlet_cell_id,))
-        if index is not None:
-            return index.upstream_of(outlet_cell_id, limit).tolist()
-        result = []
-        stack = [outlet_cell_id]
-        seen = set()
-        while stack:
-            self._check_cancelled()
-            cell_id = int(stack.pop())
-            if cell_id in seen:
-                continue
-            seen.add(cell_id)
-            result.append(cell_id)
-            if limit is not None and len(result) > limit:
-                break
-            stack.extend(self.upstream.get(cell_id, []))
+        """Returns all upstream cells contributing to a nominated outlet cell, the outlet first."""
+        cell = int(outlet_cell_id)
+        index = self.index
+        if index is None or not 0 <= cell < index.n or not index.valid[cell]:
+            return np.array([cell], dtype=np.int64)
+        return index.upstream_of(cell, limit)
+
+    def drains_through(self, cells, outlet):
+        """True where a cell drains through ``outlet``; the outlet counts as draining through itself."""
+        cells = np.asarray(cells, dtype=np.int64)
+        outlet = int(outlet)
+        index = self.index
+        if index is None or not 0 <= outlet < index.n or not index.valid[outlet]:
+            return cells == outlet
+        inside = (cells >= 0) & (cells < index.n)
+        result = np.zeros(cells.shape, dtype=bool)
+        result[inside] = index.drains_through(cells[inside], outlet)
         return result
+
+    def outermost_outlets(self, outlets):
+        """The outlets that do not drain through another one of them, largest first.
+
+        Upstream areas on a D8 graph are either nested or apart, so of a selected
+        catchment and one inside it only the outer one is kept. Equal sizes go to
+        the higher accumulation, then the higher cell id.
+        """
+        def rank(outlet):
+            size = 1
+            if self.index is not None and 0 <= outlet < self.index.n and self.index.valid[outlet]:
+                size = int(self.index.size[outlet])
+            acc = int(self.accumulation[outlet]) if self.accumulation is not None and outlet >= 0 else 0
+            return (size, acc, outlet)
+
+        kept = []
+        for outlet in sorted({int(o) for o in outlets}, key=rank, reverse=True):
+            if not any(bool(self.drains_through(outlet, other)) for other in kept):
+                kept.append(outlet)
+        return kept
+
+    def shown_among(self, cell_groups):
+        """The cells of the given groups that have a flow-path segment, ascending, each once."""
+        parts = []
+        for cells in cell_groups:
+            cells = _cell_array(cells)
+            if not cells.size:
+                continue
+            if self.shown_cells is not None:
+                parts.append(cells[self.shown_cells[cells]])
+            else:
+                parts.append(np.array([c for c in cells.tolist() if c in self.cell_to_feature], dtype=np.int64))
+        if not parts:
+            return np.empty(0, dtype=np.int64)
+        return np.unique(np.concatenate(parts))
 
     def dissolve_cells_to_geometry(self, cell_ids, chunk_size=10000):
         """Returns one dissolved polygon geometry for a collection of DEM cells.
@@ -1043,7 +1212,7 @@ class D8HydrologyEngine:
         interactive selection stage does not clutter the Layers panel with
         temporary polygon layers.
         """
-        unique_ids = sorted({int(c) for c in cell_ids})
+        unique_ids = np.unique(_cell_array(cell_ids)).tolist()
         if not unique_ids:
             return QgsGeometry()
 
@@ -1064,75 +1233,71 @@ class D8HydrologyEngine:
             return partials[0]
         return QgsGeometry.unaryUnion(partials)
 
+    def _polygonize(self, raster, row, col):
+        """GDAL outlines of the non-zero values of a block of the grid.
+
+        ``raster`` covers the grid from (``row``, ``col``). Returns a
+        ``(value, QgsGeometry)`` pair per polygon traced.
+        """
+        rows, cols = raster.shape
+        gdal_type = gdal.GDT_Int32 if raster.dtype == np.int32 else gdal.GDT_Byte
+        mem_ds = gdal.GetDriverByName("MEM").Create("", int(cols), int(rows), 1, gdal_type)
+        mem_ds.SetGeoTransform(self._grid_transform(int(row), int(col)))
+        if self.projection:
+            mem_ds.SetProjection(self.projection)
+        band = mem_ds.GetRasterBand(1)
+        band.WriteArray(raster)
+
+        ogr_ds = _vector_memory_driver().CreateDataSource("ddm_outlines")
+        ogr_layer = ogr_ds.CreateLayer("outlines", geom_type=ogr.wkbPolygon)
+        ogr_layer.CreateField(ogr.FieldDefn("value", ogr.OFTInteger))
+        # The band masks itself, so 0 (no cell) is skipped.
+        gdal.Polygonize(band, band, ogr_layer, 0, [])
+
+        found = []
+        for feature in ogr_layer:
+            ogr_geom = feature.GetGeometryRef()
+            if ogr_geom is None:
+                continue
+            geom = QgsGeometry.fromWkt(ogr_geom.ExportToWkt())
+            if geom is not None and not geom.isNull() and not geom.isEmpty():
+                found.append((int(feature.GetField(0)), geom))
+        return found
+
     def dissolve_cells_fast(self, cell_ids):
         """Catchment-boundary polygon for the interactive overlay.
 
         Unioning one square polygon per cell is slow for large catchments. This
-        instead rasterises the selected cells into a small mask over just their
-        bounding window and vectorises it with GDAL, which is typically one to two
-        orders of magnitude faster. The boundary follows the same cell edges as
-        the union, so the result is equivalent. If GDAL polygonisation is
-        unavailable or fails for any reason, it falls back to the exact per-cell
-        union in dissolve_cells_to_geometry.
+        instead marks the selected cells on the grid and vectorises just their
+        bounding window with GDAL, which is typically one to two orders of
+        magnitude faster. The boundary follows the same cell edges as the union,
+        so the result is equivalent. If GDAL polygonisation is unavailable or
+        fails for any reason, it falls back to the exact per-cell union in
+        dissolve_cells_to_geometry.
         """
         try:
-            ids = np.fromiter((int(c) for c in cell_ids), dtype=np.int64)
+            ids = _cell_array(cell_ids)
             if ids.size == 0:
                 return QgsGeometry()
             if self.geotransform is None or not self.cols:
-                return self.dissolve_cells_to_geometry(cell_ids)
+                return self.dissolve_cells_to_geometry(ids)
 
-            cols = int(self.cols)
-            cell_rows = ids // cols
-            cell_cols = ids % cols
-            r0, r1 = int(cell_rows.min()), int(cell_rows.max())
-            c0, c1 = int(cell_cols.min()), int(cell_cols.max())
-            win_rows = r1 - r0 + 1
-            win_cols = c1 - c0 + 1
-
-            mask = np.zeros((win_rows, win_cols), dtype=np.uint8)
-            mask[cell_rows - r0, cell_cols - c0] = 1
-
-            gt = self.geotransform
-            win_gt = (
-                gt[0] + c0 * gt[1] + r0 * gt[2],
-                gt[1], gt[2],
-                gt[3] + c0 * gt[4] + r0 * gt[5],
-                gt[4], gt[5],
-            )
-
-            mem_ds = gdal.GetDriverByName("MEM").Create("", win_cols, win_rows, 1, gdal.GDT_Byte)
-            mem_ds.SetGeoTransform(win_gt)
-            if self.projection:
-                mem_ds.SetProjection(self.projection)
-            band = mem_ds.GetRasterBand(1)
-            band.WriteArray(mask)
-
-            ogr_ds = ogr.GetDriverByName("Memory").CreateDataSource("ddm_dissolve")
-            srs = None
-            if self.projection:
-                srs = osr.SpatialReference()
-                srs.ImportFromWkt(self.projection)
-            ogr_layer = ogr_ds.CreateLayer("catchment", srs=srs, geom_type=ogr.wkbPolygon)
-
-            # Using the band as its own mask means only value==1 pixels are
-            # collected, so no background polygon is produced.
-            gdal.Polygonize(band, band, ogr_layer, -1, [])
-
-            geoms = []
-            for feature in ogr_layer:
-                ogr_geom = feature.GetGeometryRef()
-                if ogr_geom is None:
-                    continue
-                qgis_geom = QgsGeometry.fromWkt(ogr_geom.ExportToWkt())
-                if qgis_geom is not None and not qgis_geom.isNull() and not qgis_geom.isEmpty():
-                    geoms.append(qgis_geom)
+            grid = np.zeros(self.rows * self.cols, dtype=np.uint8)
+            grid[ids] = 1
+            grid = grid.reshape(self.rows, self.cols)
+            rows = np.flatnonzero(grid.any(axis=1))
+            cols = np.flatnonzero(grid.any(axis=0))
+            r0, r1, c0, c1 = int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
+            geoms = [geom for _value, geom in self._polygonize(np.ascontiguousarray(grid[r0:r1, c0:c1]), r0, c0)]
+            del grid
 
             if not geoms:
-                return self.dissolve_cells_to_geometry(cell_ids)
+                return self.dissolve_cells_to_geometry(ids)
             if len(geoms) == 1:
                 return geoms[0]
             return QgsGeometry.unaryUnion(geoms)
+        except MemoryError:
+            raise
         except Exception:
             # On any GDAL or binding error, fall back to the per-cell union.
             return self.dissolve_cells_to_geometry(cell_ids)
@@ -1159,21 +1324,26 @@ class D8HydrologyEngine:
         provider.addAttributes(fields)
         layer.updateFields()
 
+        cells = _cell_array(upstream_cells)
+        if self.shown_cells is not None and cells.size:
+            cells = cells[self.shown_cells[cells]]
+        orders = self.display_order
         features = []
-        for position, cell_id in enumerate(upstream_cells):
+        for position, cell_id in enumerate(cells.tolist()):
             if not position & 4095:
                 self._check_cancelled()
-            if int(cell_id) not in self.cell_to_feature:
+            if cell_id not in self.cell_to_feature:
                 continue
             down_id = int(self.downstream[cell_id])
             if down_id < 0:
                 continue
+            order = int(orders[cell_id]) if orders is not None else 0
             feat = QgsFeature(layer.fields())
             feat.setGeometry(QgsGeometry.fromPolylineXY([self.cell_center(cell_id), self.cell_center(down_id)]))
             feat.setAttributes([
                 int(cell_id),
                 int(self.accumulation[cell_id]),
-                int(getattr(self, "display_strahler_by_cell", {}).get(int(cell_id), 1)),
+                order if order >= 1 else 1,
             ])
             features.append(feat)
         provider.addFeatures(features)
@@ -1214,27 +1384,7 @@ class D8HydrologyEngine:
             return 1
         return max(1, int(math.ceil(area_m2 / self.cell_area)))
 
-    def _index_ready(self, cells=()):
-        """The array index, when it exists and every given cell is a valid cell."""
-        index = getattr(self, "index", None)
-        if index is None or not index.is_forest:
-            return None
-        for cell in cells:
-            cell = int(cell)
-            if cell < 0 or cell >= index.n or not index.valid[cell]:
-                return None
-        return index
-
-    def _index_domain(self, boundary_outlet_cells=None):
-        """The processing domain as index arrays, or None when the index is unavailable."""
-        index = self._index_ready(boundary_outlet_cells or ())
-        if index is None:
-            return None
-        if boundary_outlet_cells:
-            return index.domain(boundary_outlet_cells)
-        return index.all_valid_domain()
-
-    def _domain_cells_for_subcatchments(self, boundary_outlet_cells=None):
+    def _domain(self, boundary_outlet_cells=None):
         """Returns the DEM cells to subdivide into subcatchments.
 
         If the user drew an outlet/crossing line, only cells upstream of those
@@ -1242,183 +1392,11 @@ class D8HydrologyEngine:
         is processed. This keeps the drawn line useful without making it a
         compulsory step.
         """
-        domain = self._index_domain(boundary_outlet_cells)
-        if domain is not None:
-            return set(np.flatnonzero(domain[0]).tolist())
+        if self.index is None:
+            raise HydrologyBuildError("Press 4. Compute to create the flow paths first.")
         if boundary_outlet_cells:
-            domain = set()
-            for outlet in boundary_outlet_cells:
-                self._check_cancelled()
-                domain.update(self.collect_upstream(int(outlet)))
-            return domain
-        return set(int(c) for c in self.valid_ids)
-
-    def normalize_overlapping_cell_groups(self, groups):
-        """Merges nested/overlapping catchment cell groups into parents groups.
-
-        Upstream catchments from a D8 tree should be either disjoint or nested.
-        If the user selects both a child and it's downstream parent, drawing both
-        creates overlapping catchment polygons. This normalisation keeps the
-        larger/downstream parent group and merges any overlapping smaller child
-        group into it. The result is a dictionary whose cell sets do not overlap.
-        """
-        if not groups:
-            return {}
-
-        prepared = []
-        for key, cells in groups.items():
-            self._check_cancelled()
-            cell_set = {int(c) for c in cells or []}
-            if not cell_set:
-                continue
-            key = int(key)
-            prepared.append((key, cell_set))
-
-        # Largest catchments are most likely to be downstream parents. When sizes
-        # tie, prefer the higher accumulation outlet as the parent-ish feature.
-        prepared.sort(
-            key=lambda item: (
-                len(item[1]),
-                int(self.accumulation[item[0]]) if self.accumulation is not None and item[0] >= 0 else 0,
-                item[0],
-            ),
-            reverse=True,
-        )
-
-        kept = []
-        for key, cell_set in prepared:
-            self._check_cancelled()
-            merged = False
-            for idx, (parent_key, parent_cells) in enumerate(kept):
-                if not cell_set.isdisjoint(parent_cells):
-                    # Merge the smaller/child catchment into the parent group.
-                    parent_cells.update(cell_set)
-                    # Keep the parent key.
-                    kept[idx] = (parent_key, parent_cells)
-                    merged = True
-                    break
-            if not merged:
-                kept.append((key, set(cell_set)))
-
-        # A defensive second pass handles rare partial-overlap chains after the
-        # first merge pass. Hydrology graphs should not need it.
-        changed = True
-        while changed:
-            changed = False
-            for idx in range(len(kept)):
-                if changed:
-                    break
-                key_i, cells_i = kept[idx]
-                for jdx in range(idx + 1, len(kept)):
-                    key_j, cells_j = kept[jdx]
-                    if cells_i.isdisjoint(cells_j):
-                        continue
-                    if len(cells_j) > len(cells_i):
-                        cells_j.update(cells_i)
-                        kept[jdx] = (key_j, cells_j)
-                        kept.pop(idx)
-                    else:
-                        cells_i.update(cells_j)
-                        kept[idx] = (key_i, cells_i)
-                        kept.pop(jdx)
-                    changed = True
-                    break
-
-        return {int(key): set(cells) for key, cells in kept}
-
-    def _normalise_assignments_no_overlap(self, assignments):
-        return {key: sorted(cells) for key, cells in self.normalize_overlapping_cell_groups(assignments).items()}
-
-    def _ordered_domain_ids(self, domain_set):
-        """Domain cells ordered upstream to downstream.
-
-        Upstream cells always have lower accumulation than their downstream
-        receiver in this D8 tree, so sorting on accumulation is a deterministic
-        upstream-to-downstream traversal without a separate topological index.
-        """
-        domain_ids = list(domain_set)
-        domain_ids.sort(key=lambda cid: (int(self.accumulation[int(cid)]), int(cid)))
-        return domain_ids
-
-    def _select_area_outlets(self, domain_set, domain_ids, min_cells, include_residual=True, emit=True):
-        """Chooses subcatchment outlets by accumulated residual area.
-
-        Residual area is carried along the D8 graph; once it reaches
-        ``min_cells`` the current cell becomes an outlet and that contribution is
-        closed off. Only the outlet choice happens here, so a search over
-        ``min_cells`` can count the result without paying for cell assignment.
-        """
-        min_cells = max(1, int(min_cells))
-        pending_counts = defaultdict(int)
-        selected_outlets = []
-
-        total = max(1, len(domain_ids))
-        for idx, cell_id in enumerate(domain_ids):
-            self._check_cancelled()
-            cell_id = int(cell_id)
-            count = int(pending_counts.pop(cell_id, 0)) + 1
-            down = int(self.downstream[cell_id]) if cell_id >= 0 else -1
-            has_downstream_in_domain = down >= 0 and down in domain_set
-
-            if count >= min_cells or (include_residual and not has_downstream_in_domain and count > 0):
-                selected_outlets.append(cell_id)
-            elif has_downstream_in_domain:
-                pending_counts[down] += count
-
-            if emit and idx and idx % 50000 == 0:
-                self._emit(60 + 10 * idx / total, "Chosing minimum-size subcatchment outlets")
-
-        return selected_outlets
-
-    def _assign_cells_to_outlets(self, domain_set, domain_ids, selected_outlets):
-        """Assigns every domain cell to the first selected outlet downstream of it."""
-        selected_set = {int(o) for o in selected_outlets}
-        if not selected_set:
-            return {}
-
-        assignments = {int(outlet): [] for outlet in selected_set}
-        cache = {}
-
-        def assign_cell_to_selected_outlet(start_cell):
-            start_cell = int(start_cell)
-            if start_cell in cache:
-                return cache[start_cell]
-            path = []
-            cur = start_cell
-            while True:
-                self._check_cancelled()
-                if cur in cache:
-                    outlet = cache[cur]
-                    break
-                if cur in selected_set:
-                    outlet = cur
-                    break
-                path.append(cur)
-                down = int(self.downstream[cur]) if cur >= 0 else -1
-                if down < 0 or down not in domain_set:
-                    outlet = None
-                    break
-                cur = down
-            for item in path:
-                cache[item] = outlet
-            cache[start_cell] = outlet
-            return outlet
-
-        total = max(1, len(domain_ids))
-        for idx, cell_id in enumerate(domain_ids):
-            self._check_cancelled()
-            outlet = assign_cell_to_selected_outlet(int(cell_id))
-            if outlet is not None:
-                assignments[int(outlet)].append(int(cell_id))
-            if idx and idx % 50000 == 0:
-                self._emit(70 + 10 * idx / total, "Assigning DEM cells to subcatchment outlets")
-
-        # Drop any empty entries left by edge cases, then normalise overlaps. The
-        # assignment is designed to be cell-disjoint already; this extra pass
-        # protects stale/outlet-edge cases and keeps final polygons from
-        # overlapping.
-        assignments = {outlet: cells for outlet, cells in assignments.items() if cells}
-        return self._normalise_assignments_no_overlap(assignments)
+            return self.index.domain(boundary_outlet_cells)
+        return self.index.all_valid_domain()
 
     def _forced_mask(self, domain, forced_cells):
         """Boolean mask of the forced cut cells that fall inside the domain."""
@@ -1429,19 +1407,14 @@ class D8HydrologyEngine:
         cells = cells[(cells >= 0) & (cells < index.n)]
         mask = np.zeros(index.n, dtype=bool)
         mask[cells] = True
-        mask &= domain[0]
+        mask &= domain.mask
         return mask if mask.any() else None
 
     def forced_cells_in_domain(self, forced_cells, boundary_outlet_cells=None):
         """Splits forced cut cells into those inside the processing domain and the rest."""
         cells = [int(c) for c in (forced_cells or [])]
-        domain = self._index_domain(boundary_outlet_cells)
-        if domain is None:
-            domain_set = self._domain_cells_for_subcatchments(boundary_outlet_cells)
-            inside = [c for c in cells if c in domain_set]
-        else:
-            mask = domain[0]
-            inside = [c for c in cells if 0 <= c < mask.size and mask[c]]
+        mask = self._domain(boundary_outlet_cells).mask
+        inside = [c for c in cells if 0 <= c < mask.size and mask[c]]
         return inside, len(cells) - len(inside)
 
     def _group_chosen(self, domain, chosen):
@@ -1457,25 +1430,14 @@ class D8HydrologyEngine:
         non-overlapping subcatchments rather than repeated full upstream basins.
         Forced cells, from breaklines, are always outlets.
         """
-        domain = self._index_domain(boundary_outlet_cells)
-        if domain is not None:
-            self._emit(60, "Chosing minimum-size subcatchment outlets")
-            chosen = self.index.select_outlets(domain, min_cells, include_residual,
-                                               forced=self._forced_mask(domain, forced_cells))
-            if not chosen.any():
-                return {}
-            self._emit(70, "Assigning DEM cells to subcatchment outlets")
-            return self._group_chosen(domain, chosen)
-        if forced_cells:
-            raise HydrologyBuildError(NO_INDEX_MESSAGE)
-        domain_set = self._domain_cells_for_subcatchments(boundary_outlet_cells)
-        if not domain_set:
+        domain = self._domain(boundary_outlet_cells)
+        self._emit(60, "Chosing minimum-size subcatchment outlets")
+        chosen = self.index.select_outlets(domain, min_cells, include_residual,
+                                           forced=self._forced_mask(domain, forced_cells))
+        if not chosen.any():
             return {}
-        domain_ids = self._ordered_domain_ids(domain_set)
-        selected = self._select_area_outlets(domain_set, domain_ids, min_cells, include_residual)
-        if not selected:
-            return {}
-        return self._assign_cells_to_outlets(domain_set, domain_ids, selected)
+        self._emit(70, "Assigning DEM cells to subcatchment outlets")
+        return self._group_chosen(domain, chosen)
 
     def _bisect_threshold(self, size, target_count, count_for, max_trials):
         """Area threshold, in cells, whose outlet count comes closest to the target."""
@@ -1519,33 +1481,17 @@ class D8HydrologyEngine:
         cells that produced it, so the caller can report the difference.
         """
         target_count = max(1, int(target_count))
-        domain = self._index_domain(boundary_outlet_cells)
-        if domain is not None:
-            size = int(domain[0].sum())
-            if not size:
-                return {}, 0, 1
-            forced = self._forced_mask(domain, forced_cells)
-
-            def count_for(min_cells):
-                return int(self.index.select_outlets(domain, min_cells, True, forced=forced).sum())
-
-            best = self._bisect_threshold(size, target_count, count_for, max_trials)
-            assignments = self._group_chosen(domain, self.index.select_outlets(domain, best, True, forced=forced))
-            return assignments, len(assignments), int(best)
-        if forced_cells:
-            raise HydrologyBuildError(NO_INDEX_MESSAGE)
-
-        domain_set = self._domain_cells_for_subcatchments(boundary_outlet_cells)
-        if not domain_set:
+        domain = self._domain(boundary_outlet_cells)
+        size = domain.size
+        if not size:
             return {}, 0, 1
-        domain_ids = self._ordered_domain_ids(domain_set)
+        forced = self._forced_mask(domain, forced_cells)
 
-        def count_for_walk(min_cells):
-            return len(self._select_area_outlets(domain_set, domain_ids, min_cells, include_residual=True, emit=False))
+        def count_for(min_cells):
+            return int(np.count_nonzero(self.index.select_outlets(domain, min_cells, True, forced=forced)))
 
-        best = self._bisect_threshold(len(domain_ids), target_count, count_for_walk, max_trials)
-        selected = self._select_area_outlets(domain_set, domain_ids, best, include_residual=True)
-        assignments = self._assign_cells_to_outlets(domain_set, domain_ids, selected)
+        best = self._bisect_threshold(size, target_count, count_for, max_trials)
+        assignments = self._group_chosen(domain, self.index.select_outlets(domain, best, True, forced=forced))
         return assignments, len(assignments), int(best)
 
     def terminal_outlet_count(self, boundary_outlet_cells=None):
@@ -1555,38 +1501,17 @@ class D8HydrologyEngine:
         the count can never drop below the number of those. An outlet line that
         crosses several flow paths makes one per path.
         """
-        domain = self._index_domain(boundary_outlet_cells)
-        if domain is not None:
-            mask, _waves, inside = domain
-            return int((mask & ~inside).sum())
-        domain_set = self._domain_cells_for_subcatchments(boundary_outlet_cells)
-        count = 0
-        for cell_id in domain_set:
-            cell_id = int(cell_id)
-            down = int(self.downstream[cell_id]) if cell_id >= 0 else -1
-            if down < 0 or down not in domain_set:
-                count += 1
-        return count
+        return self.index.terminal_count(self._domain(boundary_outlet_cells))
 
     def strahler_orders_available(self, boundary_outlet_cells=None):
         """Strahler orders present on the displayed stream network inside the domain."""
-        domain = self._index_domain(boundary_outlet_cells)
-        if domain is not None:
-            orders = self._domain_order_array(domain)[domain[0]]
-            return sorted(int(v) for v in np.unique(orders) if int(v) >= 1)
-        domain_set = self._domain_cells_for_subcatchments(boundary_outlet_cells)
-        orders = getattr(self, "display_strahler_by_cell", {}) or {}
-        return sorted({int(v) for c, v in orders.items() if int(c) in domain_set and int(v) >= 1})
-
-    def _display_order_array(self):
-        """Displayed Strahler order per cell, 0 off the displayed network."""
-        orders = getattr(self, "display_strahler_by_cell", {}) or {}
-        array = np.zeros(self.index.n, dtype=np.int16)
-        if orders:
-            cells = np.fromiter(orders.keys(), dtype=np.int64, count=len(orders))
-            values = np.fromiter(orders.values(), dtype=np.int64, count=len(orders))
-            array[cells] = values
-        return array
+        domain = self._domain(boundary_outlet_cells)
+        orders = self._domain_order_array(domain)
+        counts = np.zeros(128, dtype=np.int64)
+        for start in range(0, domain.size, BLOCK):
+            values = orders[domain.cells[start:start + BLOCK]]
+            counts += np.bincount(values[values > 0], minlength=128)[:128]
+        return [int(v) for v in np.flatnonzero(counts) if v >= 1]
 
     def _domain_order_array(self, domain):
         """Strahler order per cell for a processing domain.
@@ -1597,33 +1522,40 @@ class D8HydrologyEngine:
         displayed upstream cells make where they meet there.
         """
         index = self.index
-        mask, _waves, inside = domain
-        stream_order = self._display_order_array()
-        cells = np.flatnonzero(mask)
-        bare = np.zeros(index.n, dtype=bool)
-        bare[cells[~inside[cells] & (stream_order[cells] == 0)]] = True
-        feeding = cells[inside[cells] & (stream_order[cells] > 0)]
+        if self.display_order is None:
+            stream_order = np.zeros(index.n, dtype=np.int8)
+        else:
+            stream_order = self.display_order.copy()
+        bare, feeding = [], []
+        for cells, receivers in index.blocks(domain):
+            stays = index.stays(domain, receivers)
+            own = stream_order[cells]
+            bare.append(cells[~stays & (own == 0)])
+            feeding.append(cells[stays & (own > 0)])
+        bare = np.concatenate(bare) if bare else np.empty(0, dtype=np.int32)
+        if not bare.size:
+            return stream_order
+        is_bare = np.zeros(index.n, dtype=bool)
+        is_bare[bare] = True
+        feeding = np.concatenate(feeding)
         receivers = index.parent[feeding]
-        reach = bare[receivers]
+        reach = is_bare[receivers]
         feeding, receivers = feeding[reach], receivers[reach]
         if receivers.size:
             orders = stream_order[feeding]
-            top = np.zeros(index.n, dtype=np.int16)
-            np.maximum.at(top, receivers, orders)
-            tied = np.zeros(index.n, dtype=np.int32)
-            np.add.at(tied, receivers, orders == top[receivers])
-            fed = np.unique(receivers)
-            stream_order[fed] = top[fed] + (tied[fed] >= 2)
+            fed, slot = np.unique(receivers, return_inverse=True)
+            top = np.zeros(fed.size, dtype=np.int8)
+            np.maximum.at(top, slot, orders)
+            tied = np.zeros(fed.size, dtype=np.int32)
+            np.add.at(tied, slot, orders == top[slot])
+            stream_order[fed] = top + (tied >= 2)
         return stream_order
 
     def minimum_subcatchment_count(self, boundary_outlet_cells=None, forced_cells=None):
         """Fewest subcatchments any breakdown can give: the outlets plus the breakline cuts."""
-        domain = self._index_domain(boundary_outlet_cells)
-        if domain is None:
-            return self.terminal_outlet_count(boundary_outlet_cells) + len(forced_cells or [])
-        size = int(domain[0].sum())
+        domain = self._domain(boundary_outlet_cells)
         forced = self._forced_mask(domain, forced_cells)
-        return int(self.index.select_outlets(domain, size + 1, True, forced=forced).sum())
+        return int(np.count_nonzero(self.index.select_outlets(domain, domain.size + 1, True, forced=forced)))
 
     def build_strahler_subcatchments(self, order, boundary_outlet_cells=None, forced_cells=None,
                                      sliver_fraction=0.5):
@@ -1646,21 +1578,22 @@ class D8HydrologyEngine:
         number of subcatchments built around streams of the chosen order, and the
         number of slivers absorbed.
         """
-        domain = self._index_domain(boundary_outlet_cells)
-        if domain is None:
-            raise HydrologyBuildError(NO_INDEX_MESSAGE)
+        domain = self._domain(boundary_outlet_cells)
         index = self.index
-        mask, _waves, inside = domain
         k = max(1, int(order))
         stream_order = self._domain_order_array(domain)
 
         # A stream of order k ends where the next cell down is of a higher order,
         # or where it leaves the domain.
-        cells = np.flatnonzero(mask)
-        own = stream_order[cells]
-        below = np.where(inside[cells], stream_order[np.maximum(index.parent[cells], 0)], 0)
-        ends = cells[(own == k) & (~inside[cells] | (below > k))]
-        terminals = cells[~inside[cells]]
+        ends, terminals = [], []
+        for cells, receivers in index.blocks(domain):
+            stays = index.stays(domain, receivers)
+            own = stream_order[cells]
+            below = np.where(stays, stream_order[np.maximum(receivers, 0)], 0)
+            ends.append(cells[(own == k) & (~stays | (below > k))])
+            terminals.append(cells[~stays])
+        ends = np.sort(np.concatenate(ends)) if ends else np.empty(0, dtype=np.int32)
+        terminals = np.sort(np.concatenate(terminals)) if terminals else np.empty(0, dtype=np.int32)
 
         protected = np.zeros(index.n, dtype=bool)
         for end in ends.tolist():
@@ -1671,7 +1604,7 @@ class D8HydrologyEngine:
                 protected[upstream] = True
 
         sizes = index.size[ends]
-        threshold = max(1, int(round(float(sizes.mean())))) if sizes.size else max(1, int(mask.sum()))
+        threshold = max(1, int(round(float(sizes.mean())))) if sizes.size else max(1, domain.size)
 
         fixed = np.zeros(index.n, dtype=bool)
         fixed[terminals] = True
@@ -1701,12 +1634,11 @@ class D8HydrologyEngine:
         leftover is settled on its own in one pass. ``chosen`` is updated in place;
         returns the number of cuts dropped.
         """
-        mask, _waves, inside = domain
         index = self.index
         outlets = np.flatnonzero(chosen)
-        keys, counts = np.unique(owner[np.flatnonzero(mask)], return_counts=True)
-        size = dict(zip(keys.tolist(), counts.tolist()))
-        receiver = np.where(inside[outlets], owner[np.maximum(index.parent[outlets], 0)], -1)
+        size = index.owner_sizes(domain, owner)
+        receivers = index.parent[outlets]
+        receiver = np.where(index.stays(domain, receivers), owner[np.maximum(receivers, 0)], -1)
         feeders = {}
         for outlet, down, droppable in zip(outlets.tolist(), receiver.tolist(), (~fixed[outlets]).tolist()):
             if droppable and down >= 0:
@@ -1730,47 +1662,32 @@ class D8HydrologyEngine:
         Every assigned cell is written into a label raster over the combined
         extent, and GDAL traces all the outlines at once. The boundaries follow the
         same cell edges as a union of one square per cell, at a fraction of the
-        time. A subcatchment in more than one part (cells joined only at a corner)
-        is left to that union, because pointOnSurface can pick a different part
-        depending on the order the parts come in. Returns None if GDAL cannot do
-        it, so the caller falls back for every subcatchment.
+        time. Returns None if GDAL cannot do it, so the caller falls back for
+        every subcatchment.
         """
         try:
-            keys = [int(k) for k, cells in assignments.items() if cells]
+            keys = [int(k) for k, cells in assignments.items() if len(cells)]
             if not keys or self.geotransform is None or not self.cols:
                 return None
             cols = int(self.cols)
-            ids = np.concatenate([np.asarray(assignments[k], dtype=np.int64) for k in keys])
-            labels = np.concatenate([np.full(len(assignments[k]), i + 1, dtype=np.int32) for i, k in enumerate(keys)])
-            cell_rows, cell_cols = ids // cols, ids % cols
-            r0, c0 = int(cell_rows.min()), int(cell_cols.min())
-            win_rows, win_cols = int(cell_rows.max()) - r0 + 1, int(cell_cols.max()) - c0 + 1
-            raster = np.zeros((win_rows, win_cols), dtype=np.int32)
-            raster[cell_rows - r0, cell_cols - c0] = labels
-
-            gt = self.geotransform
-            mem_ds = gdal.GetDriverByName("MEM").Create("", win_cols, win_rows, 1, gdal.GDT_Int32)
-            mem_ds.SetGeoTransform((gt[0] + c0 * gt[1] + r0 * gt[2], gt[1], gt[2],
-                                    gt[3] + c0 * gt[4] + r0 * gt[5], gt[4], gt[5]))
-            if self.projection:
-                mem_ds.SetProjection(self.projection)
-            band = mem_ds.GetRasterBand(1)
-            band.WriteArray(raster)
-
-            ogr_ds = ogr.GetDriverByName("Memory").CreateDataSource("ddm_outlines")
-            ogr_layer = ogr_ds.CreateLayer("outlines", geom_type=ogr.wkbPolygon)
-            ogr_layer.CreateField(ogr.FieldDefn("label", ogr.OFTInteger))
-            # The band masks itself, so label 0 (no subcatchment) is skipped.
-            gdal.Polygonize(band, band, ogr_layer, 0, [])
+            r0 = c0 = None
+            r1 = c1 = -1
+            for key in keys:
+                cells = np.asarray(assignments[key])
+                rows = cells // cols
+                columns = cells % cols
+                r0 = int(rows.min()) if r0 is None else min(r0, int(rows.min()))
+                c0 = int(columns.min()) if c0 is None else min(c0, int(columns.min()))
+                r1, c1 = max(r1, int(rows.max())), max(c1, int(columns.max()))
+            raster = np.zeros((r1 - r0 + 1, c1 - c0 + 1), dtype=np.int32)
+            for position, key in enumerate(keys, start=1):
+                cells = np.asarray(assignments[key])
+                raster[cells // cols - r0, cells % cols - c0] = position
 
             parts = defaultdict(list)
-            for feature in ogr_layer:
-                ogr_geom = feature.GetGeometryRef()
-                if ogr_geom is None:
-                    continue
-                geom = QgsGeometry.fromWkt(ogr_geom.ExportToWkt())
-                if geom is not None and not geom.isNull() and not geom.isEmpty():
-                    parts[int(feature.GetField(0))].append(geom)
+            for value, geom in self._polygonize(raster, r0, c0):
+                parts[value].append(geom)
+            del raster
 
             outlines = {}
             for position, key in enumerate(keys, start=1):
@@ -1779,6 +1696,8 @@ class D8HydrologyEngine:
                     return None
                 if len(geoms) == 1:
                     outlines[key] = self._on_cell_grid(geoms[0])
+                else:
+                    outlines[key] = QgsGeometry.unaryUnion([self._on_cell_grid(g) for g in geoms])
             return outlines
         except Exception:
             log_ignored("hydrology_engine.dissolve_assignment_polygons")
@@ -1822,6 +1741,14 @@ class D8HydrologyEngine:
             return geom
         return QgsGeometry.fromMultiPolygonXY(rebuilt) if multipart else QgsGeometry.fromPolygonXY(rebuilt[0])
 
+    def _outlet_order(self, outlet_id):
+        """Strahler order of a subcatchment outlet: its displayed order, else its cell order."""
+        if self.display_order is not None:
+            shown = int(self.display_order[outlet_id])
+            if shown > 0:
+                return shown
+        return int(self.strahler[outlet_id])
+
     def create_subcatchment_layer(self, assignments, min_cells=1, dissolve_limit=None):
         """Create a temporary polygon layer with one dissolved outline per subcatchment."""
         layer = QgsVectorLayer(
@@ -1853,7 +1780,7 @@ class D8HydrologyEngine:
         features = []
         for idx, (outlet_id, cells) in enumerate(assignments.items()):
             self._check_cancelled()
-            if not cells:
+            if not len(cells):
                 continue
 
             # Always dissolve DEM-cell polygons: collectGeometry leaves a cell grid,
@@ -1886,7 +1813,7 @@ class D8HydrologyEngine:
                 int(len(cells)),
                 area_m2,
                 round(float(area_m2 / 10000.0), 2),
-                int(getattr(self, "display_strahler_by_cell", {}).get(int(outlet_id), self.strahler[outlet_id])),
+                self._outlet_order(int(outlet_id)),
                 0,
                 "",
             ])
